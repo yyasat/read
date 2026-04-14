@@ -48,7 +48,6 @@
             transition: background-color 0.3s, color 0.3s;
             min-height: 100vh;
             overflow-x: hidden;
-            /* 适配全屏遮挡状态栏 */
             padding-top: env(safe-area-inset-top);
         }
 
@@ -581,8 +580,7 @@
         function switchTab(tab) {
             document.getElementById('tab-archive').style.display = tab === 'archive' ? 'block' : 'none';
             document.getElementById('tab-discover').style.display = tab === 'discover' ? 'block' : 'none';
-            document.getElementById('tab-about').style.display = tab === 'about' ? 'none' : 'none';
-            if(tab === 'about') document.getElementById('tab-about').style.display = 'block';
+            document.getElementById('tab-about').style.display = tab === 'about' ? 'block' : 'none';
             
             const navs = document.querySelectorAll('.nav-btn');
             navs.forEach((n, idx) => {
@@ -1156,7 +1154,9 @@
             const active = document.querySelectorAll('.chapter-wrapper')[currentChapterIdx];
             const offset = active ? (area.scrollTop - active.offsetTop) : 0;
             let s = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--font-size'));
-            document.documentElement.style.setProperty('--font-size', Math.max(12, Math.min(32, s + d)) + 'px');
+            let newVal = Math.max(12, Math.min(32, s + d)) + 'px';
+            document.documentElement.style.setProperty('--font-size', newVal);
+            localStorage.setItem('yy_font_size_v22', newVal);
             requestAnimationFrame(() => {
                 if (active) area.scrollTop = active.offsetTop + offset;
                 updateProgressBars();
@@ -1168,7 +1168,9 @@
             const active = document.querySelectorAll('.chapter-wrapper')[currentChapterIdx];
             const offset = active ? (area.scrollTop - active.offsetTop) : 0;
             let s = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--line-height'));
-            document.documentElement.style.setProperty('--line-height', Math.max(1.2, Math.min(2.8, s + d)));
+            let newVal = Math.max(1.2, Math.min(2.8, s + d));
+            document.documentElement.style.setProperty('--line-height', newVal);
+            localStorage.setItem('yy_line_height_v22', newVal);
             requestAnimationFrame(() => {
                 if (active) area.scrollTop = active.offsetTop + offset;
                 updateProgressBars();
