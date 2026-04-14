@@ -1,4 +1,3 @@
-<!-- qaq html editor -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -7,6 +6,8 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="mobile-web-app-capable" content="yes">
+    <link rel="apple-touch-icon" href="https://cac-assets.oss-cn-shanghai.aliyuncs.com/cms/report/qdqqd/IspAgKiy_vip.png">
+    <link rel="icon" href="https://cac-assets.oss-cn-shanghai.aliyuncs.com/cms/report/qdqqd/IspAgKiy_vip.png">
     <meta name="full-screen" content="yes">
     <meta name="browsermode" content="application">
     <meta name="x5-fullscreen" content="true">
@@ -235,11 +236,11 @@
         .record-close-hint { font-size: 0.6rem; color: var(--accent-color); opacity: 0.4; text-align: center; margin-top: 10px; }
     </style>
 </head>
-<body onload="setupSwipeInteractions()" onclick="goFullScreen()">
+<body onload="setupSwipeInteractions()">
 
     <div id="home-view" class="container">
         <header>
-            <div class="logo"><span style="margin-top:0; margin-bottom:12px; letter-spacing:1px; font-size:0.6rem; font-weight:500; display:block;">Library Archive</span>藏书馆</div>
+            <div class="logo"><img src="https://cac-assets.oss-cn-shanghai.aliyuncs.com/cms/report/qdqqd/IspAgKiy_vip.png" style="width:30px; height:30px; margin-bottom:5px;"><span style="margin-top:0; margin-bottom:12px; letter-spacing:1px; font-size:0.6rem; font-weight:500; display:block;">Library Archive</span>藏书馆</div>
             <div class="theme-trigger" id="theme-trigger" onclick="openThemeModal()"></div>
         </header>
 
@@ -509,21 +510,6 @@
     <script>
         document.addEventListener('contextmenu', function(e) { e.preventDefault(); });
         
-        function goFullScreen() {
-            const doc = document.documentElement;
-            try {
-                if (doc.requestFullscreen) doc.requestFullscreen();
-                else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-                else if (doc.mozRequestFullScreen) doc.mozRequestFullScreen();
-                else if (doc.msRequestFullscreen) doc.msRequestFullscreen();
-            } catch (e) {}
-            window.scrollTo(0, 1);
-        }
-
-        window.addEventListener('touchstart', goFullScreen, { once: true });
-        window.addEventListener('click', goFullScreen, { once: true });
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) goFullScreen(); });
-
         let db;
         const DB_NAME = "YanYeDB_Precision_V22";
         const STORE_NAME = "books";
@@ -575,8 +561,6 @@
             const lh = localStorage.getItem('yy_line_height_v22');
             if(lh) document.documentElement.style.setProperty('--line-height', lh);
             renderCategoryBar(); renderBookshelf(); applyTheme(localStorage.getItem('yy_theme_v22') || 'auto'); setupObserver(); 
-            goFullScreen();
-            setTimeout(goFullScreen, 500);
         }
 
         function setTheme(mode) { localStorage.setItem('yy_theme_v22', mode); applyTheme(mode); }
