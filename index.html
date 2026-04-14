@@ -1,3 +1,4 @@
+<!-- qaq html editor -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -6,6 +7,10 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="mobile-web-app-capable" content="yes">
+    <meta name="full-screen" content="yes">
+    <meta name="browsermode" content="application">
+    <meta name="x5-fullscreen" content="true">
+    <meta name="x5-page-mode" content="app">
     <title>藏书馆</title>
     <style>
         :root {
@@ -506,11 +511,18 @@
         
         function goFullScreen() {
             const doc = document.documentElement;
-            if (doc.requestFullscreen) doc.requestFullscreen();
-            else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-            else if (doc.mozRequestFullScreen) doc.mozRequestFullScreen();
-            else if (doc.msRequestFullscreen) doc.msRequestFullscreen();
+            try {
+                if (doc.requestFullscreen) doc.requestFullscreen();
+                else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+                else if (doc.mozRequestFullScreen) doc.mozRequestFullScreen();
+                else if (doc.msRequestFullscreen) doc.msRequestFullscreen();
+            } catch (e) {}
+            window.scrollTo(0, 1);
         }
+
+        window.addEventListener('touchstart', goFullScreen, { once: true });
+        window.addEventListener('click', goFullScreen, { once: true });
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) goFullScreen(); });
 
         let db;
         const DB_NAME = "YanYeDB_Precision_V22";
@@ -563,6 +575,8 @@
             const lh = localStorage.getItem('yy_line_height_v22');
             if(lh) document.documentElement.style.setProperty('--line-height', lh);
             renderCategoryBar(); renderBookshelf(); applyTheme(localStorage.getItem('yy_theme_v22') || 'auto'); setupObserver(); 
+            goFullScreen();
+            setTimeout(goFullScreen, 500);
         }
 
         function setTheme(mode) { localStorage.setItem('yy_theme_v22', mode); applyTheme(mode); }
@@ -580,7 +594,8 @@
         function switchTab(tab) {
             document.getElementById('tab-archive').style.display = tab === 'archive' ? 'block' : 'none';
             document.getElementById('tab-discover').style.display = tab === 'discover' ? 'block' : 'none';
-            document.getElementById('tab-about').style.display = tab === 'about' ? 'block' : 'none';
+            document.getElementById('tab-about').style.display = tab === 'about' ? 'none' : 'none';
+            if(tab === 'about') document.getElementById('tab-about').style.display = 'block';
             
             const navs = document.querySelectorAll('.nav-btn');
             navs.forEach((n, idx) => {
