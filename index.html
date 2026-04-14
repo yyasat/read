@@ -2,8 +2,11 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>藏书馆 | 极简无痕阅读</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>藏书馆</title>
     <style>
         :root {
             --bg-color: #fdfcf8;
@@ -29,7 +32,13 @@
             --highlight-color: #4a4516;
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        * { 
+            margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; 
+            -webkit-touch-callout: none; -webkit-user-select: none; -khtml-user-select: none; 
+            -moz-user-select: none; -ms-user-select: none; user-select: none; 
+        }
+
+        input, textarea, #reader-content { -webkit-user-select: text; user-select: text; }
 
         body {
             font-family: "Source Han Serif SC", "Noto Serif SC", "Source Han Sans SC", serif;
@@ -39,6 +48,8 @@
             transition: background-color 0.3s, color 0.3s;
             min-height: 100vh;
             overflow-x: hidden;
+            /* 适配全屏遮挡状态栏 */
+            padding-top: env(safe-area-inset-top);
         }
 
         .container { max-width: 600px; margin: 0 auto; padding: 20px; }
@@ -108,7 +119,7 @@
 
         #reader-view { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg-color); z-index: 100; background-size: cover; background-position: center; }
         #reader-scroll-area { height: 100%; overflow-y: auto; padding: 0 25px 150px; scroll-behavior: auto; }
-        .reader-header { position: fixed; top: 0; left: 0; width: 100%; padding: 5px 15px; background: inherit; display: flex; justify-content: space-between; align-items: center; z-index: 105; border-bottom: 1px solid var(--border-color); transition: 0.4s; height: 50px; }
+        .reader-header { position: fixed; top: 0; left: 0; width: 100%; padding: 5px 15px; background: inherit; display: flex; justify-content: space-between; align-items: center; z-index: 105; border-bottom: 1px solid var(--border-color); transition: 0.4s; height: 50px; padding-top: calc(env(safe-area-inset-top) / 2); }
         .reader-header.hidden { transform: translateY(-100%); }
         .nav-icon-btn { width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-color); }
         .nav-icon-btn svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
@@ -207,20 +218,20 @@
 
         /* Record Card Styles */
         #record-card-overlay, #notes-edit-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.2); z-index: 500; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); transition: 0.4s; }
-        #record-card, #notes-edit-card { width: 85%; max-width: 340px; background: #fff; border-radius: 12px; padding: 25px; box-shadow: 0 20px 40px rgba(0,0,0,0.15); transform: scale(0); opacity: 0; transition: 0.6s cubic-bezier(0.34, 1.56, 0.64, 1); position: relative; border: 1px solid var(--border-color); }
+        #record-card, #notes-edit-card { width: 85%; max-width: 340px; background: var(--card-bg); border-radius: 12px; padding: 25px; box-shadow: 0 20px 40px rgba(0,0,0,0.15); transform: scale(0); opacity: 0; transition: 0.6s cubic-bezier(0.34, 1.56, 0.64, 1); position: relative; border: 1px solid var(--border-color); }
         #record-card.active, #notes-edit-card.active { transform: scale(1); opacity: 1; }
-        .record-card-header { border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 15px; }
-        .record-title-input { width: 100%; border: none; font-size: 1.2rem; font-weight: bold; color: var(--text-color); font-family: inherit; outline: none; margin-bottom: 4px; }
+        .record-card-header { border-bottom: 1px solid var(--border-color); padding-bottom: 10px; margin-bottom: 15px; }
+        .record-title-input { width: 100%; border: none; font-size: 1.2rem; font-weight: bold; color: var(--text-color); font-family: inherit; outline: none; margin-bottom: 4px; background: transparent; }
         .record-time-display { font-size: 0.7rem; color: var(--accent-color); opacity: 0.6; }
-        .record-content-area { width: 100%; height: 180px; border: none; outline: none; resize: none; font-family: inherit; font-size: 0.9rem; line-height: 1.6; color: var(--text-color); }
-        .record-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; padding-top: 10px; border-top: 1px solid #eee; }
+        .record-content-area { width: 100%; height: 180px; border: none; outline: none; resize: none; font-family: inherit; font-size: 0.9rem; line-height: 1.6; color: var(--text-color); background: transparent; }
+        .record-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; padding-top: 10px; border-top: 1px solid var(--border-color); }
         .record-page-ctrl { display: flex; align-items: center; gap: 12px; font-size: 0.8rem; color: var(--accent-color); }
         .record-btn { cursor: pointer; padding: 5px; opacity: 0.6; transition: 0.3s; }
         .record-btn:hover { opacity: 1; }
         .record-close-hint { font-size: 0.6rem; color: var(--accent-color); opacity: 0.4; text-align: center; margin-top: 10px; }
     </style>
 </head>
-<body onload="setupSwipeInteractions()">
+<body onload="setupSwipeInteractions()" onclick="goFullScreen()">
 
     <div id="home-view" class="container">
         <header>
@@ -492,6 +503,16 @@
     </div>
 
     <script>
+        document.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+        
+        function goFullScreen() {
+            const doc = document.documentElement;
+            if (doc.requestFullscreen) doc.requestFullscreen();
+            else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+            else if (doc.mozRequestFullScreen) doc.mozRequestFullScreen();
+            else if (doc.msRequestFullscreen) doc.msRequestFullscreen();
+        }
+
         let db;
         const DB_NAME = "YanYeDB_Precision_V22";
         const STORE_NAME = "books";
@@ -537,7 +558,13 @@
             getAll.onsuccess = () => { books = getAll.result; init(); };
         }
 
-        function init() { renderCategoryBar(); renderBookshelf(); applyTheme(localStorage.getItem('yy_theme_v22') || 'auto'); setupObserver(); }
+        function init() { 
+            const sz = localStorage.getItem('yy_font_size_v22');
+            if(sz) document.documentElement.style.setProperty('--font-size', sz);
+            const lh = localStorage.getItem('yy_line_height_v22');
+            if(lh) document.documentElement.style.setProperty('--line-height', lh);
+            renderCategoryBar(); renderBookshelf(); applyTheme(localStorage.getItem('yy_theme_v22') || 'auto'); setupObserver(); 
+        }
 
         function setTheme(mode) { localStorage.setItem('yy_theme_v22', mode); applyTheme(mode); }
         function applyTheme(mode) {
@@ -554,7 +581,8 @@
         function switchTab(tab) {
             document.getElementById('tab-archive').style.display = tab === 'archive' ? 'block' : 'none';
             document.getElementById('tab-discover').style.display = tab === 'discover' ? 'block' : 'none';
-            document.getElementById('tab-about').style.display = tab === 'about' ? 'block' : 'none';
+            document.getElementById('tab-about').style.display = tab === 'about' ? 'none' : 'none';
+            if(tab === 'about') document.getElementById('tab-about').style.display = 'block';
             
             const navs = document.querySelectorAll('.nav-btn');
             navs.forEach((n, idx) => {
@@ -1090,7 +1118,15 @@
                 </div>`).join(''); 
         }
 
-        function closeReader() { document.getElementById('home-view').style.display = 'block'; document.getElementById('reader-view').style.display = 'none'; renderBookshelf(); closePanels(); }
+        function closeReader() { 
+            const root = document.documentElement;
+            localStorage.setItem('yy_font_size_v22', getComputedStyle(root).getPropertyValue('--font-size'));
+            localStorage.setItem('yy_line_height_v22', getComputedStyle(root).getPropertyValue('--line-height'));
+            document.getElementById('home-view').style.display = 'block'; 
+            document.getElementById('reader-view').style.display = 'none'; 
+            renderBookshelf(); 
+            closePanels(); 
+        }
         function handleReaderClick(e) { const y = e.clientY, h = window.innerHeight; if (y > h * 0.3 && y < h * 0.7) toggleMenu(); else closePanels(); }
         function toggleMenu() { 
             const menu = document.getElementById('bottom-menu'), nav = document.getElementById('reader-nav'); 
