@@ -63,7 +63,7 @@ header {
 .theme-trigger svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
 .shelf-header { display: flex; align-items: center; margin-bottom: 10px; gap: 10px; }
-.categories { display: flex; gap: 20px; overflow-x: auto; flex-grow: 1; scrollbar-width: none; align-items: center; padding-bottom: 5px; }
+.categories { display: flex; gap: 20px; overflow-x: auto; flex-grow: 1; scrollbar-width: none; align-items: center; padding-bottom: 5px; min-width: 0; }
 .categories::-webkit-scrollbar { display: none; }
 .cat-item { font-size: 0.9rem; white-space: nowrap; cursor: pointer; color: var(--text-color); opacity: 0.4; transition: 0.3s; }
 .cat-item.active { opacity: 1; font-weight: bold; border-bottom: 2px solid var(--text-color); }
@@ -87,10 +87,12 @@ header {
 /* ── 书架：网格布局 ── */
 #bookshelf {
     width: 100%;
+    max-width: 100%;
     padding: 6px 0 100px;
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 32px 16px;
+    /* minmax(0, 1fr) 是关键：1fr 的默认下限是 min-content，长书名会把列宽顶爆 */
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 26px 14px;
 }
 
 .book-card {
@@ -102,28 +104,32 @@ header {
     border-bottom: none;
     padding: 0;
     position: relative;
+    min-width: 0;
+    max-width: 100%;
     transition: transform 0.15s ease;
 }
 .book-card:active { background: none; transform: scale(0.97); }
 
 .book-cover-wrap {
     width: 100%;
+    min-width: 0;
     position: relative;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
 }
 
 .book-index {
     position: absolute;
-    top: -8px;
-    left: -8px;
+    top: -6px;
+    left: -6px;
     z-index: 2;
     font-family: "Georgia", serif;
     font-style: italic;
     font-weight: 900;
-    font-size: 0.6rem;
+    font-size: 0.55rem;
+    line-height: 1;
     color: var(--bg-color);
     background: var(--accent-color);
-    padding: 3px 7px;
+    padding: 4px 6px;
     border-radius: 3px;
     box-shadow: 1px 2px 5px rgba(0,0,0,0.2);
 }
@@ -133,24 +139,44 @@ header {
     aspect-ratio: 3 / 4.2;
     background: var(--card-bg);
     border: 1px solid var(--border-color);
-    box-shadow: 3px 5px 14px rgba(0,0,0,0.15);
+    box-shadow: 3px 4px 12px rgba(0,0,0,0.13);
     overflow: hidden;
     display: flex;
     align-items: center;
     justify-content: center;
     position: relative;
 }
+/* 不支持 aspect-ratio 的老内核兜底 */
+@supports not (aspect-ratio: 3 / 4) {
+    .book-cover { height: 0; padding-bottom: 140%; }
+}
 .book-card.highlight-focus .book-cover { outline: 3px solid var(--accent-color); outline-offset: 2px; transition: outline 0.3s; }
 
 .book-cover-img { position: absolute; width: 100%; height: 100%; top: 0; left: 0; object-fit: cover; }
-.book-cover-text { font-size: 0.75rem; text-align: center; z-index: 1; padding: 8px; font-weight: bold; line-height: 1.3; word-break: break-all; color: var(--text-color); background: rgba(255,255,255,0.4); width: 100%; }
+.book-cover-text { font-size: 0.6rem; text-align: center; z-index: 1; padding: 6px 4px; font-weight: bold; line-height: 1.35; overflow-wrap: anywhere; word-break: break-word; color: var(--text-color); background: rgba(255,255,255,0.4); width: 100%; max-height: 100%; overflow: hidden; }
 [data-theme="dark"] .book-cover-text { background: rgba(0,0,0,0.4); }
 
-.book-info { width: 100%; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 2px; }
-.book-info h3 { font-size: 0.85rem; width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 700; color: var(--text-color); text-align: center; }
-.book-last-read { font-size: 0.6rem; width: 100%; color: var(--accent-color); opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-style: italic; text-align: center; }
-.book-meta { display: flex; gap: 8px; font-size: 0.62rem; color: var(--accent-color); align-items: center; justify-content: center; margin-top: 2px; opacity: 0.6; flex-wrap: wrap; }
-.book-tag { padding: 1px 6px; border: 1px solid var(--border-color); border-radius: 2px; font-size: 0.58rem; background: var(--panel-bg); text-transform: uppercase; }
+.book-info { width: 100%; max-width: 100%; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.book-info h3 {
+    font-size: 0.75rem;
+    line-height: 1.35;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    font-weight: 700;
+    color: var(--text-color);
+    text-align: center;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.book-last-read { font-size: 0.55rem; line-height: 1.4; width: 100%; max-width: 100%; min-width: 0; color: var(--accent-color); opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-style: italic; text-align: center; }
+.book-meta { display: flex; gap: 6px; font-size: 0.58rem; color: var(--accent-color); align-items: center; justify-content: center; margin-top: 3px; opacity: 0.6; flex-wrap: wrap; max-width: 100%; min-width: 0; }
+.book-tag { padding: 1px 5px; border: 1px solid var(--border-color); border-radius: 2px; font-size: 0.55rem; background: var(--panel-bg); text-transform: uppercase; white-space: nowrap; }
 
 .shelf-bottom-nav { position: fixed; bottom: 0; left: 0; width: 100%; background: var(--panel-bg); border-top: 1px solid var(--border-color); display: flex; justify-content: space-around; align-items: center; padding: 6px 0 12px; z-index: 95; }
 .nav-btn { display: flex; flex-direction: column; align-items: center; cursor: pointer; flex: 1; opacity: 0.5; transition: 0.3s; }
@@ -236,7 +262,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .page-dot.active { background: var(--text-color); transform: scale(1.3); }
 .flip-hint { font-size: 0.7rem; color: var(--accent-color); opacity: 0.6; font-style: italic; }
 
-.theme-option-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 10px; }
+.theme-option-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 15px; margin-top: 10px; }
 .theme-opt { display: flex; flex-direction: column; align-items: center; gap: 8px; cursor: pointer; padding: 15px 5px; border: 1px solid var(--border-color); transition: 0.2s; color: var(--text-color); }
 .theme-opt.active { border-color: var(--text-color); background: var(--panel-bg); font-weight: bold; }
 .theme-opt svg { width: 24px; height: 24px; stroke: currentColor; fill: none; stroke-width: 2; }
