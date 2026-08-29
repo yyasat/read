@@ -35,9 +35,14 @@ const themeIcons = {
     auto: `<svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>`
 };
 
-const request = indexedDB.open(DB_NAME, 1);
-request.onupgradeneeded = (e) => { db = e.target.result; if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME, { keyPath: "id" }); };
+/* 数据库版本升到 2：新增 rawFile 字段存原始字节，用于随时切换编码重新解码 */
+const request = indexedDB.open(DB_NAME, 2);
+request.onupgradeneeded = (e) => {
+    db = e.target.result;
+    if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME, { keyPath: "id" });
+};
 request.onsuccess = (e) => { db = e.target.result; loadBooksFromDB(); };
+request.onerror = () => { alert('数据库打开失败，请检查浏览器是否允许本地存储。'); };
 
 function loadBooksFromDB() {
     const store = db.transaction([STORE_NAME], "readonly").objectStore(STORE_NAME);
@@ -135,7 +140,7 @@ function renderBookshelf() {
         card.oncontextmenu = (e) => { e.preventDefault(); };
         const showTitle = book.showTitleOnCover !== false;
         const lastRead = book.lastReadChapterTitle ? `上次读到：${book.lastReadChapterTitle}` : '从未读过';
-        const garbledFlag = isGarbled(book.content) ? `<div class="book-garbled-tip" onclick="event.stopPropagation(); showGarbledHelp()">编码异常</div>` : '';
+        const garbledFlag = isGarbled(book.content) ? `<div class="book-garbled-tip" onclick="event.stopPropagation(); showGarbledHelp(${book.id})">编码异常</div>` : '';
         card.innerHTML = `
             <div class="book-cover-wrap">
                 <div class="book-index">${idx}</div>
@@ -163,8 +168,15 @@ function isGarbled(text) {
     return bad / sample.length > 0.05;
 }
 
-function showGarbledHelp() {
-    alert('这本书是用旧版本导入的，导入时按 UTF-8 解码了 GBK 文件，原文已损坏无法还原。\n\n请双击此书打开详情 → 移除此书，然后重新导入同一个 TXT 文件即可（新版本会自动识别 GBK 编码）。');
+function showGarbledHelp(id) {
+    const book = books.find(b => b.id === id);
+    if (book && book.rawFile) {
+        if (confirm('检测到这本书解码有误。\n\n原始文件已保存，可以直接用 GBK 重新解码，不用删书重导。要现在试一下吗？')) {
+            reDecodeBook(id, 'gb18030');
+        }
+        return;
+    }
+    alert('这本书是旧版本导入的，没有保存原始文件字节，无法就地修复。\n\n请双击此书 → 移除此书，然后重新导入同一个 TXT。新版本会自动识别 GBK。');
 }
 
 function handleSearch(query) {
@@ -283,82 +295,39 @@ function closeSearch(clearInput = true) {
     }
 }
 
-/* ─────────────────────────────────────────────
-   编码自动识别
-   问题：readAsText() 默认按 UTF-8 解码，
-   而国内 TXT 小说绝大多数是 GBK/GB2312，
-   会解出满屏 U+FFFD（口字码）。
-   方案：BOM 优先 → 严格 UTF-8 校验 → 多编码
-         试解后按替换字符数和汉字数打分取最优。
-   ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════
+   编码识别
+   为什么不用 TextDecoder 做主力：
+   老版 Android WebView 的 TextDecoder 常常
+   不带 gb18030 等中文编码表，指定了也会静默
+   退回 UTF-8，于是仍然满屏 U+FFFD。
+   FileReader.readAsText(file, '编码名') 走的是
+   浏览器传统解码路径，兼容性好得多，所以用它
+   做实际解码，TextDecoder 只负责 BOM 和严格
+   UTF-8 校验这两件它一定能做到的事。
+   ═══════════════════════════════════════════ */
 
+const ENCODING_LABELS = {
+    'gb18030': '简体中文 GBK / GB18030',
+    'gbk': '简体中文 GBK',
+    'big5': '繁体中文 BIG5',
+    'utf-8': 'UTF-8',
+    'utf-16le': 'UTF-16 LE',
+    'utf-16be': 'UTF-16 BE'
+};
+
+// 打分：U+FFFD 越少越好，汉字越多越好
 function scoreDecoded(text) {
-    let bad = 0, cjk = 0;
-    const sample = text.length > 20000 ? text.slice(0, 20000) : text;
+    let bad = 0, cjk = 0, ctrl = 0;
+    const sample = text.length > 30000 ? text.slice(0, 30000) : text;
     for (let i = 0; i < sample.length; i++) {
         const c = sample.charCodeAt(i);
         if (c === 0xFFFD) bad++;
         else if (c >= 0x4E00 && c <= 0x9FFF) cjk++;
         else if (c >= 0x3400 && c <= 0x4DBF) cjk++;
+        else if (c < 0x09 || (c > 0x0D && c < 0x20)) ctrl++;
     }
-    return { bad, cjk };
-}
-
-function tryDecode(buffer, encoding) {
-    try {
-        // fatal:false → 遇非法字节产出 U+FFFD 而不抛错，便于打分
-        return new TextDecoder(encoding, { fatal: false }).decode(buffer);
-    } catch (e) {
-        return null;
-    }
-}
-
-function detectAndDecode(buffer) {
-    const bytes = new Uint8Array(buffer);
-
-    // 1. BOM 判定，最可靠
-    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
-        const t = tryDecode(buffer, 'utf-8');
-        if (t !== null) return { text: t.replace(/^\uFEFF/, ''), encoding: 'UTF-8 (BOM)' };
-    }
-    if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
-        const t = tryDecode(buffer, 'utf-16le');
-        if (t !== null) return { text: t.replace(/^\uFEFF/, ''), encoding: 'UTF-16LE' };
-    }
-    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
-        const t = tryDecode(buffer, 'utf-16be');
-        if (t !== null) return { text: t.replace(/^\uFEFF/, ''), encoding: 'UTF-16BE' };
-    }
-
-    // 2. 无 BOM：严格 UTF-8 校验，能通过的必定是 UTF-8
-    try {
-        const strict = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
-        return { text: strict, encoding: 'UTF-8' };
-    } catch (e) {
-        // 不是合法 UTF-8，继续试双字节中文编码
-    }
-
-    // 3. 逐个试解打分。gb18030 是 GBK/GB2312 超集，放第一位
-    const candidates = [];
-    ['gb18030', 'big5', 'utf-8'].forEach(enc => {
-        const text = tryDecode(buffer, enc);
-        if (text === null) return;
-        const s = scoreDecoded(text);
-        candidates.push({ encoding: enc, text, bad: s.bad, cjk: s.cjk });
-    });
-
-    if (candidates.length === 0) {
-        return { text: new TextDecoder().decode(buffer), encoding: 'UTF-8 (fallback)' };
-    }
-
-    // 坏字符少者优先；平手则汉字多者优先
-    let best = candidates[0];
-    for (let i = 1; i < candidates.length; i++) {
-        const c = candidates[i];
-        if (c.bad < best.bad) best = c;
-        else if (c.bad === best.bad && c.cjk > best.cjk) best = c;
-    }
-    return { text: best.text, encoding: best.encoding.toUpperCase() };
+    return { bad: bad + ctrl, cjk, len: sample.length };
 }
 
 function readFileAsBuffer(file) {
@@ -370,6 +339,174 @@ function readFileAsBuffer(file) {
     });
 }
 
+// 用指定编码把 Blob/File 读成文本；标签不被支持时浏览器会退回 UTF-8，交给打分环节淘汰
+function readBlobAsText(blob, encoding) {
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = () => resolve(null);
+        try {
+            reader.readAsText(blob, encoding);
+        } catch (err) {
+            resolve(null);
+        }
+    });
+}
+
+// 有没有 BOM，顺便判断是不是合法 UTF-8
+function inspectBytes(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+        return { bom: 'utf-8' };
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
+        return { bom: 'utf-16le' };
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
+        return { bom: 'utf-16be' };
+    }
+    // 严格 UTF-8 校验：能通过的必定是 UTF-8，不用再猜
+    try {
+        new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+        return { bom: null, strictUtf8: true };
+    } catch (e) {
+        return { bom: null, strictUtf8: false };
+    }
+}
+
+/* 主流程：blob 进，{ text, encoding } 出 */
+async function detectAndDecode(blob) {
+    const buffer = await readFileAsBuffer(blob);
+    const info = inspectBytes(buffer);
+
+    // 1. 有 BOM，直接照 BOM 解
+    if (info.bom) {
+        const text = await readBlobAsText(blob, info.bom);
+        if (text !== null) {
+            return { text: text.replace(/^\uFEFF/, ''), encoding: info.bom };
+        }
+    }
+
+    // 2. 严格 UTF-8 校验通过，就是 UTF-8
+    if (info.strictUtf8) {
+        const text = await readBlobAsText(blob, 'utf-8');
+        if (text !== null) return { text: text.replace(/^\uFEFF/, ''), encoding: 'utf-8' };
+    }
+
+    // 3. 逐个试解并打分。gb18030 是 GBK/GB2312 超集，放第一位
+    const candidates = ['gb18030', 'gbk', 'big5', 'utf-8'];
+    const results = [];
+    for (const enc of candidates) {
+        const text = await readBlobAsText(blob, enc);
+        if (text === null || text === '') continue;
+        const s = scoreDecoded(text);
+        results.push({ encoding: enc, text, bad: s.bad, cjk: s.cjk });
+    }
+
+    if (results.length === 0) {
+        // 所有编码都失败的极端情况，退回默认
+        const fallback = await readBlobAsText(blob, 'utf-8');
+        return { text: fallback || '', encoding: 'utf-8' };
+    }
+
+    // 坏字符少者优先；平手则汉字多者优先
+    let best = results[0];
+    for (let i = 1; i < results.length; i++) {
+        const c = results[i];
+        if (c.bad < best.bad) best = c;
+        else if (c.bad === best.bad && c.cjk > best.cjk) best = c;
+    }
+    return { text: best.text, encoding: best.encoding };
+}
+
+/* 用指定编码重新解码已入库的书 */
+async function reDecodeBook(id, encoding) {
+    const book = books.find(b => b.id === id);
+    if (!book) return;
+    if (!book.rawFile) {
+        alert('这本书没有保存原始文件，无法重新解码。请移除后重新导入。');
+        return;
+    }
+    try {
+        let text;
+        if (encoding === 'auto') {
+            const r = await detectAndDecode(book.rawFile);
+            text = r.text;
+            book.encoding = r.encoding;
+        } else {
+            text = await readBlobAsText(book.rawFile, encoding);
+            if (text === null) throw new Error('该编码不被当前浏览器支持');
+            book.encoding = encoding;
+        }
+        book.content = text.replace(/^\uFEFF/, '');
+        // 重新解码后原有的阅读进度已经失去意义
+        book.lastReadChapterIdx = 0;
+        book.lastReadChapterTitle = '';
+        book.lastReadOffset = 0;
+        updateBookInDB(book);
+        renderBookshelf();
+        syncEncodingUI(book);
+        toast(isGarbled(book.content) ? `${book.encoding} 解码后仍有乱码，换一个试试` : `✓ 已用 ${book.encoding} 重新解码`);
+    } catch (e) {
+        toast('重新解码失败：' + e.message);
+    }
+}
+
+function toast(msg) {
+    let el = document.getElementById('yy-toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'yy-toast';
+        el.style.cssText = 'position:fixed; left:50%; bottom:90px; transform:translateX(-50%); background:var(--text-color); color:var(--bg-color); padding:10px 18px; border-radius:20px; font-size:0.8rem; z-index:9999; max-width:80%; text-align:center; transition:opacity 0.3s;';
+        document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(el.hideTimer);
+    el.hideTimer = setTimeout(() => { el.style.opacity = '0'; }, 2600);
+}
+
+/* 在「书籍详情」弹窗里动态插入编码选择区（不用改 HTML） */
+function ensureEncodingUI() {
+    if (document.getElementById('encoding-section')) return;
+    const categoryGroup = document.getElementById('edit-category');
+    if (!categoryGroup) return;
+    const anchor = categoryGroup.closest('.input-group');
+    if (!anchor) return;
+
+    const section = document.createElement('div');
+    section.id = 'encoding-section';
+    section.className = 'input-group';
+    section.innerHTML = `
+        <label>文本编码</label>
+        <select id="edit-encoding" style="margin-bottom:8px;">
+            <option value="auto">自动识别</option>
+            <option value="gb18030">简体中文 GBK / GB18030</option>
+            <option value="big5">繁体中文 BIG5</option>
+            <option value="utf-8">UTF-8</option>
+            <option value="utf-16le">UTF-16 LE</option>
+        </select>
+        <button class="btn" style="width:100%; padding:8px; font-size:0.8rem;" onclick="reDecodeBook(currentBookId, document.getElementById('edit-encoding').value)">用此编码重新解码</button>
+        <div id="encoding-hint" style="font-size:0.68rem; color:var(--accent-color); opacity:0.7; margin-top:6px; line-height:1.5;"></div>
+    `;
+    anchor.parentNode.insertBefore(section, anchor.nextSibling);
+}
+
+function syncEncodingUI(book) {
+    const sel = document.getElementById('edit-encoding');
+    const hint = document.getElementById('encoding-hint');
+    if (!sel || !hint) return;
+    const cur = (book.encoding || '').toLowerCase();
+    sel.value = ['gb18030', 'big5', 'utf-8', 'utf-16le'].includes(cur) ? cur : 'auto';
+    if (!book.rawFile) {
+        hint.textContent = '这本书导入时没有保存原始文件，无法重新解码。移除后重新导入即可获得此功能。';
+        sel.disabled = true;
+    } else {
+        sel.disabled = false;
+        hint.textContent = `当前编码：${book.encoding || '未知'}。若正文是乱码，换一个编码重新解码（阅读进度会重置）。`;
+    }
+}
+
 async function importFiles(event) {
     const files = Array.from(event.target.files);
     if (!files.length) return;
@@ -377,14 +514,14 @@ async function importFiles(event) {
     const report = [];
     for (const file of files) {
         try {
-            const buffer = await readFileAsBuffer(file);
-            const { text, encoding } = detectAndDecode(buffer);
+            const { text, encoding } = await detectAndDecode(file);
             const newBook = {
                 id: Date.now() + Math.random(),
                 name: file.name.replace(/\.[^/.]+$/, ""),
                 author: "",
                 content: text,
                 encoding: encoding,
+                rawFile: file,          // 存原始字节，方便以后换编码重解
                 category: categories[0] || '其他',
                 cover: '',
                 showTitleOnCover: true,
@@ -397,19 +534,21 @@ async function importFiles(event) {
             };
             books.push(newBook);
             db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).add(newBook);
-            report.push(encoding);
+            report.push({ name: newBook.name, encoding, garbled: isGarbled(text) });
         } catch (err) {
-            report.push('读取失败');
+            report.push({ name: file.name, encoding: '读取失败', garbled: true });
         }
     }
     renderBookshelf();
     event.target.value = '';
 
-    const toastEl = document.getElementById('backup-toast');
-    if (toastEl && report.length) {
-        toastEl.style.display = 'block';
-        toastEl.textContent = `✓ 已导入 ${report.length} 本 · 编码 ${report[0]}`;
-        setTimeout(() => { toastEl.style.display = 'none'; }, 2500);
+    if (report.length) {
+        const bad = report.filter(r => r.garbled);
+        if (bad.length) {
+            toast(`导入 ${report.length} 本，${bad.length} 本仍有乱码，双击该书手动选编码`);
+        } else {
+            toast(`✓ 已导入 ${report.length} 本 · 编码 ${report[0].encoding}`);
+        }
     }
 }
 
@@ -955,6 +1094,8 @@ function openEditModal(id) {
     document.getElementById('edit-notes').value = b.notes || '';
     tempCoverData = b.cover;
     updatePreview(b.cover, b.name, b.showTitleOnCover !== false);
+    ensureEncodingUI();
+    syncEncodingUI(b);
     switchEditPage(0);
     document.getElementById('edit-modal').style.display = 'flex';
 }
@@ -1056,13 +1197,11 @@ function searchNotes(query) {
     const q = query.toLowerCase();
     const hits = [];
     books.forEach(b => {
-        // 搜索 notes 字段
         if (b.notes && b.notes.toLowerCase().includes(q)) {
             const idx = b.notes.toLowerCase().indexOf(q);
             const snippet = b.notes.substring(Math.max(0, idx - 30), idx + 60).replace(/\n/g, ' ');
             hits.push({ bookName: b.name, bookId: b.id, type: '备注', snippet, matchIdx: idx });
         }
-        // 搜索 recordCards
         if (b.recordCards && b.recordCards.length) {
             b.recordCards.forEach(card => {
                 const haystack = ((card.title || '') + ' ' + (card.content || '')).toLowerCase();
@@ -1106,13 +1245,18 @@ async function exportBackup() {
             req.onsuccess = () => res(req.result);
             req.onerror = rej;
         });
+        // rawFile 是 File 对象，没法 JSON 序列化，导出时剔除
+        const plainBooks = allBooks.map(b => {
+            const copy = Object.assign({}, b);
+            delete copy.rawFile;
+            return copy;
+        });
         const backup = {
-            version: '2.2',
+            version: '2.3',
             exportTime: new Date().toISOString(),
             categories: JSON.parse(localStorage.getItem('yy_cats_v22') || '[]'),
-            books: allBooks
+            books: plainBooks
         };
-        // 备份文件用 UTF-8 写出并加 BOM，避免再被误判编码
         const blob = new Blob(['\uFEFF' + JSON.stringify(backup)], { type: 'application/json;charset=utf-8' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -1134,19 +1278,15 @@ async function importBackup(event) {
     toastEl.style.display = 'block';
     toastEl.textContent = '正在读取备份…';
     try {
-        // 备份文件同样走编码探测，兼容旧版本导出的文件
-        const buffer = await readFileAsBuffer(file);
-        const { text } = detectAndDecode(buffer);
+        const { text } = await detectAndDecode(file);
         const backup = JSON.parse(text.replace(/^\uFEFF/, ''));
         if (!backup.books || !Array.isArray(backup.books)) throw new Error('备份文件格式错误');
 
-        // 合并分类（不重复）
         if (backup.categories && Array.isArray(backup.categories)) {
             backup.categories.forEach(c => { if (!categories.includes(c)) categories.push(c); });
             localStorage.setItem('yy_cats_v22', JSON.stringify(categories));
         }
 
-        // 合并书籍（以 id 去重，已有的不覆盖）
         const existingIds = new Set(books.map(b => b.id));
         let added = 0;
         const tx = db.transaction([STORE_NAME], 'readwrite');
