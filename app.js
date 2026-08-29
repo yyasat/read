@@ -45,19 +45,23 @@ function loadBooksFromDB() {
     getAll.onsuccess = () => { books = getAll.result; init(); };
 }
 
-function init() { 
+function init() {
     const sz = localStorage.getItem('yy_font_size_v22');
-    if(sz) document.documentElement.style.setProperty('--font-size', sz);
+    if (sz) document.documentElement.style.setProperty('--font-size', sz);
     const lh = localStorage.getItem('yy_line_height_v22');
-    if(lh) document.documentElement.style.setProperty('--line-height', lh);
-    renderCategoryBar(); renderBookshelf(); applyTheme(localStorage.getItem('yy_theme_v22') || 'auto'); setupObserver(); 
+    if (lh) document.documentElement.style.setProperty('--line-height', lh);
+    renderCategoryBar();
+    renderBookshelf();
+    applyTheme(localStorage.getItem('yy_theme_v22') || 'auto');
+    setupObserver();
 }
 
 function setTheme(mode) { localStorage.setItem('yy_theme_v22', mode); applyTheme(mode); }
+
 function applyTheme(mode) {
     const root = document.documentElement;
     document.querySelectorAll('.theme-opt').forEach(opt => opt.classList.remove('active'));
-    if(document.getElementById(`opt-${mode}`)) document.getElementById(`opt-${mode}`).classList.add('active');
+    if (document.getElementById(`opt-${mode}`)) document.getElementById(`opt-${mode}`).classList.add('active');
     document.getElementById('theme-trigger').innerHTML = themeIcons[mode];
     if (mode === 'auto') {
         const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -69,7 +73,7 @@ function switchTab(tab) {
     document.getElementById('tab-archive').style.display = tab === 'archive' ? 'block' : 'none';
     document.getElementById('tab-discover').style.display = tab === 'discover' ? 'block' : 'none';
     document.getElementById('tab-about').style.display = tab === 'about' ? 'block' : 'none';
-    
+
     const navs = document.querySelectorAll('.nav-btn');
     navs.forEach((n, idx) => {
         const isMatch = (tab === 'archive' && idx === 0) || (tab === 'discover' && idx === 1) || (tab === 'about' && idx === 2);
@@ -90,19 +94,22 @@ function renderBookshelf() {
     const shelf = document.getElementById('bookshelf');
     shelf.innerHTML = '';
     const filtered = currentFilter === '全部' ? books : books.filter(b => b.category === currentFilter);
-    if(filtered.length === 0) { shelf.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; padding: 100px 20px; opacity: 0.3; font-size: 0.9rem;">书架空空如也</div>`; return; }
+    if (filtered.length === 0) {
+        shelf.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; padding: 100px 20px; opacity: 0.3; font-size: 0.9rem;">书架空空如也</div>`;
+        return;
+    }
     filtered.forEach((book, i) => {
         const idx = (i + 1).toString().padStart(2, '0');
         const card = document.createElement('div');
         card.className = 'book-card';
         card.id = 'book-card-' + book.id;
-        
+
         let lastClick = 0;
 
         card.addEventListener('touchstart', (e) => {
             recordTouchY = e.touches[0].clientY;
             recordTouchTime = Date.now();
-        }, {passive: true});
+        }, { passive: true });
 
         card.addEventListener('touchend', (e) => {
             const diffY = recordTouchY - e.changedTouches[0].clientY;
@@ -110,7 +117,7 @@ function renderBookshelf() {
             if (diffTime > 400 && diffY > 40) {
                 openRecordCard(book.id);
             }
-        }, {passive: true});
+        }, { passive: true });
 
         card.onclick = () => {
             const now = Date.now();
@@ -128,9 +135,11 @@ function renderBookshelf() {
         card.oncontextmenu = (e) => { e.preventDefault(); };
         const showTitle = book.showTitleOnCover !== false;
         const lastRead = book.lastReadChapterTitle ? `上次读到：${book.lastReadChapterTitle}` : '从未读过';
+        const garbledFlag = isGarbled(book.content) ? `<div class="book-garbled-tip" onclick="event.stopPropagation(); showGarbledHelp()">编码异常</div>` : '';
         card.innerHTML = `
             <div class="book-cover-wrap">
                 <div class="book-index">${idx}</div>
+                ${garbledFlag}
                 <div class="book-cover">${book.cover ? `<img src="${book.cover}" class="book-cover-img">` : ''}${showTitle ? `<div class="book-cover-text">${book.name.substring(0, 12)}</div>` : ''}</div>
             </div>
             <div class="book-info">
@@ -143,12 +152,27 @@ function renderBookshelf() {
     });
 }
 
+/* ── 乱码检测：U+FFFD 替换字符占比过高即判定为编码异常 ── */
+function isGarbled(text) {
+    if (!text) return false;
+    const sample = text.slice(0, 3000);
+    let bad = 0;
+    for (let i = 0; i < sample.length; i++) {
+        if (sample.charCodeAt(i) === 0xFFFD) bad++;
+    }
+    return bad / sample.length > 0.05;
+}
+
+function showGarbledHelp() {
+    alert('这本书是用旧版本导入的，导入时按 UTF-8 解码了 GBK 文件，原文已损坏无法还原。\n\n请双击此书打开详情 → 移除此书，然后重新导入同一个 TXT 文件即可（新版本会自动识别 GBK 编码）。');
+}
+
 function handleSearch(query) {
     const panel = document.getElementById('search-panel');
     const resultsDiv = document.getElementById('search-results');
     const searchContainer = document.querySelector('.search-container');
     const placeholder = document.getElementById('search-placeholder');
-    
+
     if (!query.trim()) {
         panel.classList.remove('open');
         closeSearch(false);
@@ -179,7 +203,7 @@ function handleSearch(query) {
 
     const matched = books.filter(b => b.name.toLowerCase().includes(query.toLowerCase()));
     if (matched.length > 0) {
-        const regex = new RegExp(`(${query})`, 'gi');
+        const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
         resultsDiv.innerHTML = matched.map(b => {
             const highlightedName = b.name.replace(regex, '<span class="search-highlight">$1</span>');
             const lastRead = b.lastReadChapterTitle ? `上次读到：${b.lastReadChapterTitle}` : '从未读过';
@@ -245,7 +269,7 @@ function closeSearch(clearInput = true) {
         searchContainer.style.top = rect.top + 'px';
         searchContainer.style.padding = '0px';
         searchContainer.style.backgroundColor = 'transparent';
-        
+
         searchReturnTimeout = setTimeout(() => {
             if (!document.getElementById('shelf-search').value.trim() || clearInput) {
                 searchContainer.classList.remove('searching');
@@ -259,22 +283,142 @@ function closeSearch(clearInput = true) {
     }
 }
 
+/* ─────────────────────────────────────────────
+   编码自动识别
+   问题：readAsText() 默认按 UTF-8 解码，
+   而国内 TXT 小说绝大多数是 GBK/GB2312，
+   会解出满屏 U+FFFD（口字码）。
+   方案：BOM 优先 → 严格 UTF-8 校验 → 多编码
+         试解后按替换字符数和汉字数打分取最优。
+   ───────────────────────────────────────────── */
+
+function scoreDecoded(text) {
+    let bad = 0, cjk = 0;
+    const sample = text.length > 20000 ? text.slice(0, 20000) : text;
+    for (let i = 0; i < sample.length; i++) {
+        const c = sample.charCodeAt(i);
+        if (c === 0xFFFD) bad++;
+        else if (c >= 0x4E00 && c <= 0x9FFF) cjk++;
+        else if (c >= 0x3400 && c <= 0x4DBF) cjk++;
+    }
+    return { bad, cjk };
+}
+
+function tryDecode(buffer, encoding) {
+    try {
+        // fatal:false → 遇非法字节产出 U+FFFD 而不抛错，便于打分
+        return new TextDecoder(encoding, { fatal: false }).decode(buffer);
+    } catch (e) {
+        return null;
+    }
+}
+
+function detectAndDecode(buffer) {
+    const bytes = new Uint8Array(buffer);
+
+    // 1. BOM 判定，最可靠
+    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+        const t = tryDecode(buffer, 'utf-8');
+        if (t !== null) return { text: t.replace(/^\uFEFF/, ''), encoding: 'UTF-8 (BOM)' };
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
+        const t = tryDecode(buffer, 'utf-16le');
+        if (t !== null) return { text: t.replace(/^\uFEFF/, ''), encoding: 'UTF-16LE' };
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
+        const t = tryDecode(buffer, 'utf-16be');
+        if (t !== null) return { text: t.replace(/^\uFEFF/, ''), encoding: 'UTF-16BE' };
+    }
+
+    // 2. 无 BOM：严格 UTF-8 校验，能通过的必定是 UTF-8
+    try {
+        const strict = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+        return { text: strict, encoding: 'UTF-8' };
+    } catch (e) {
+        // 不是合法 UTF-8，继续试双字节中文编码
+    }
+
+    // 3. 逐个试解打分。gb18030 是 GBK/GB2312 超集，放第一位
+    const candidates = [];
+    ['gb18030', 'big5', 'utf-8'].forEach(enc => {
+        const text = tryDecode(buffer, enc);
+        if (text === null) return;
+        const s = scoreDecoded(text);
+        candidates.push({ encoding: enc, text, bad: s.bad, cjk: s.cjk });
+    });
+
+    if (candidates.length === 0) {
+        return { text: new TextDecoder().decode(buffer), encoding: 'UTF-8 (fallback)' };
+    }
+
+    // 坏字符少者优先；平手则汉字多者优先
+    let best = candidates[0];
+    for (let i = 1; i < candidates.length; i++) {
+        const c = candidates[i];
+        if (c.bad < best.bad) best = c;
+        else if (c.bad === best.bad && c.cjk > best.cjk) best = c;
+    }
+    return { text: best.text, encoding: best.encoding.toUpperCase() };
+}
+
+function readFileAsBuffer(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsArrayBuffer(file);
+    });
+}
+
 async function importFiles(event) {
     const files = Array.from(event.target.files);
+    if (!files.length) return;
+
+    const report = [];
     for (const file of files) {
-        await new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                const newBook = { id: Date.now() + Math.random(), name: file.name.replace(/\.[^/.]+$/, ""), author: "", content: e.target.result, category: categories[0] || '其他', cover: '', showTitleOnCover: true, annotations: [], lastReadChapterIdx: 0, lastReadChapterTitle: "", lastReadOffset: 0, notes: "", recordCards: [] };
-                books.push(newBook);
-                db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).add(newBook);
-                resolve();
+        try {
+            const buffer = await readFileAsBuffer(file);
+            const { text, encoding } = detectAndDecode(buffer);
+            const newBook = {
+                id: Date.now() + Math.random(),
+                name: file.name.replace(/\.[^/.]+$/, ""),
+                author: "",
+                content: text,
+                encoding: encoding,
+                category: categories[0] || '其他',
+                cover: '',
+                showTitleOnCover: true,
+                annotations: [],
+                lastReadChapterIdx: 0,
+                lastReadChapterTitle: "",
+                lastReadOffset: 0,
+                notes: "",
+                recordCards: []
             };
-            reader.readAsText(file);
-        });
+            books.push(newBook);
+            db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).add(newBook);
+            report.push(encoding);
+        } catch (err) {
+            report.push('读取失败');
+        }
     }
     renderBookshelf();
-    event.target.value = ''; 
+    event.target.value = '';
+
+    const toastEl = document.getElementById('backup-toast');
+    if (toastEl && report.length) {
+        toastEl.style.display = 'block';
+        toastEl.textContent = `✓ 已导入 ${report.length} 本 · 编码 ${report[0]}`;
+        setTimeout(() => { toastEl.style.display = 'none'; }, 2500);
+    }
+}
+
+// 章节正文需转义，解码后的原文可能含 < > & 等字符
+function escapeHTML(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
 function openReader(id) {
@@ -289,7 +433,7 @@ function openReader(id) {
         const book = books.find(b => b.id === id);
         document.getElementById('reader-book-title').innerText = book.name;
         document.getElementById('reader-notes-display').innerText = book.notes || '无备注';
-        
+
         document.getElementById('side-title').innerText = book.name;
         const sAuthor = document.getElementById('side-author');
         if (book.author) { sAuthor.innerText = book.author; sAuthor.style.display = 'block'; }
@@ -297,37 +441,37 @@ function openReader(id) {
 
         const chapterRegex = /(?=第[零一二三四五六七八九十百千万\d]+[章节回部集卷])|(?=Chapter\s*\d+)/i;
         const parts = book.content.split(chapterRegex);
-        
+
         chapters = parts.map((content, i) => {
             if (i === 0) return { title: "正文开始", content };
             const title = content.trim().split(/\r?\n/)[0];
             return { title: title || `第 ${i} 节`, content };
         }).filter(c => c.content.trim().length > 0);
-        
+
         const container = document.getElementById('reader-content');
         container.innerHTML = chapters.map((ch, i) => `
             <div class="chapter-wrapper" data-index="${i}">
-                <div class="chapter-title-divider">${ch.title}</div>
-                <div class="chapter-body">${ch.content}</div>
+                <div class="chapter-title-divider">${escapeHTML(ch.title)}</div>
+                <div class="chapter-body">${escapeHTML(ch.content)}</div>
             </div>
         `).join('');
-        
+
         currentChapterIdx = book.lastReadChapterIdx || 0;
         renderTOC();
-        
+
         document.getElementById('home-view').style.display = 'none';
         document.getElementById('reader-view').style.display = 'block';
-        
+
         requestAnimationFrame(() => {
             const scrollArea = document.getElementById('reader-scroll-area');
             scrollArea.scrollTop = book.lastReadOffset || 0;
-            
+
             requestAnimationFrame(() => {
                 scrollArea.scrollTop = book.lastReadOffset || 0;
                 document.querySelectorAll('.chapter-wrapper').forEach(w => observer.observe(w));
                 updateActiveChapterUI(currentChapterIdx);
                 updateProgressBars();
-                
+
                 loader.style.opacity = '0';
                 setTimeout(() => {
                     if (loader.style.opacity === '0') {
@@ -354,9 +498,9 @@ function openRecordCard(id) {
     const book = books.find(b => b.id === id);
     const bookCard = document.getElementById('book-card-' + id);
     const rect = bookCard ? bookCard.getBoundingClientRect() : null;
-    
+
     if (!book.recordCards) book.recordCards = [];
-    
+
     let currentChapter = "";
     if (document.getElementById('reader-view').style.display === 'block' && chapters[currentChapterIdx]) {
         currentChapter = chapters[currentChapterIdx].title;
@@ -367,24 +511,24 @@ function openRecordCard(id) {
     }
     recordPageIndex = 0;
     updateRecordCardUI();
-    
+
     const overlay = document.getElementById('record-card-overlay');
     const card = document.getElementById('record-card');
-    
+
     if (rect) {
         const cardWidth = Math.min(window.innerWidth * 0.85, 340);
         const viewCenterX = window.innerWidth / 2;
         const viewCenterY = window.innerHeight / 2;
         const bookCenterX = rect.left + rect.width / 2;
         const bookCenterY = rect.top + rect.height / 2;
-        
+
         const relativeX = bookCenterX - (viewCenterX - cardWidth / 2);
         const relativeY = bookCenterY - (viewCenterY - 150);
         card.style.transformOrigin = `${relativeX}px ${relativeY}px`;
     } else {
         card.style.transformOrigin = 'center center';
     }
-    
+
     overlay.style.display = 'flex';
     setTimeout(() => card.classList.add('active'), 10);
 }
@@ -501,11 +645,11 @@ function updateActiveChapterUI(idx) {
     currentChapterIdx = idx;
     const title = chapters[idx].title;
     document.getElementById('reader-chapter-title').innerText = title + ` (${idx + 1}/${chapters.length})`;
-    
+
     document.querySelectorAll('.chapter-item').forEach((item, i) => {
         item.classList.toggle('active', i === idx);
     });
-    
+
     const book = books.find(b => b.id === currentBookId);
     if (book) {
         book.lastReadChapterIdx = idx;
@@ -530,7 +674,7 @@ function updateProgressBars() {
     const scrollHeight = scrollArea.scrollHeight;
     const clientHeight = scrollArea.clientHeight;
     const wrappers = document.querySelectorAll('.chapter-wrapper');
-    
+
     let activeIdx = 0;
     for (let i = 0; i < wrappers.length; i++) {
         if (wrappers[i].offsetTop <= scrollTop + 80) {
@@ -546,11 +690,11 @@ function updateProgressBars() {
 
     const totalScrollable = scrollHeight - clientHeight;
     const fullProg = totalScrollable > 0 ? (scrollTop / totalScrollable) : 0;
-    
+
     const fullBar = document.getElementById('full-progress-bar');
     const fullText = document.getElementById('full-progress-text');
-    if(fullBar) fullBar.value = fullProg * 1000;
-    if(fullText) fullText.innerText = (fullProg * 100).toFixed(1) + '%';
+    if (fullBar) fullBar.value = fullProg * 1000;
+    if (fullText) fullText.innerText = (fullProg * 100).toFixed(1) + '%';
 
     const activeChapter = wrappers[activeIdx];
     if (activeChapter) {
@@ -558,11 +702,11 @@ function updateProgressBars() {
         const chapterH = activeChapter.offsetHeight;
         let chapterProg = (scrollTop + 80 - chapterTop) / chapterH;
         chapterProg = Math.max(0, Math.min(1, chapterProg));
-        
+
         const chapBar = document.getElementById('chapter-progress-bar');
         const chapText = document.getElementById('chapter-progress-text');
-        if(chapBar) chapBar.value = chapterProg * 1000;
-        if(chapText) chapText.innerText = (chapterProg * 100).toFixed(1) + '%';
+        if (chapBar) chapBar.value = chapterProg * 1000;
+        if (chapText) chapText.innerText = (chapterProg * 100).toFixed(1) + '%';
     }
 }
 
@@ -596,37 +740,43 @@ function nextChapter() {
     }
 }
 
-function jumpToChapter(idx) { 
+function jumpToChapter(idx) {
     const target = document.querySelector(`.chapter-wrapper[data-index="${idx}"]`);
     if (target) {
         document.getElementById('reader-scroll-area').scrollTop = target.offsetTop - 70;
         updateActiveChapterUI(idx);
         updateProgressBars();
     }
-    closePanels(); 
+    closePanels();
 }
 
-function renderTOC() { 
-    document.getElementById('toc-list').innerHTML = chapters.map((ch, i) => 
+function renderTOC() {
+    document.getElementById('toc-list').innerHTML = chapters.map((ch, i) =>
         `<div class="chapter-item ${i === currentChapterIdx ? 'active' : ''}" onclick="jumpToChapter(${i})">
-            <span>${ch.title}</span>
-            <span style="font-size:0.7rem; opacity:0.5;">${Math.round((i+1)/chapters.length*100)}%</span>
-        </div>`).join(''); 
+            <span>${escapeHTML(ch.title)}</span>
+            <span style="font-size:0.7rem; opacity:0.5;">${Math.round((i + 1) / chapters.length * 100)}%</span>
+        </div>`).join('');
 }
 
-function closeReader() { 
+function closeReader() {
     const root = document.documentElement;
     localStorage.setItem('yy_font_size_v22', getComputedStyle(root).getPropertyValue('--font-size'));
     localStorage.setItem('yy_line_height_v22', getComputedStyle(root).getPropertyValue('--line-height'));
-    document.getElementById('home-view').style.display = 'block'; 
-    document.getElementById('reader-view').style.display = 'none'; 
-    renderBookshelf(); 
-    closePanels(); 
+    document.getElementById('home-view').style.display = 'block';
+    document.getElementById('reader-view').style.display = 'none';
+    renderBookshelf();
+    closePanels();
 }
-function handleReaderClick(e) { const y = e.clientY, h = window.innerHeight; if (y > h * 0.3 && y < h * 0.7) toggleMenu(); else closePanels(); }
-function toggleMenu() { 
-    const menu = document.getElementById('bottom-menu'), nav = document.getElementById('reader-nav'); 
-    const open = menu.classList.toggle('open'); 
+
+function handleReaderClick(e) {
+    const y = e.clientY, h = window.innerHeight;
+    if (y > h * 0.3 && y < h * 0.7) toggleMenu();
+    else closePanels();
+}
+
+function toggleMenu() {
+    const menu = document.getElementById('bottom-menu'), nav = document.getElementById('reader-nav');
+    const open = menu.classList.toggle('open');
     nav.classList.toggle('hidden', !open);
     if (open) {
         updateProgressBars();
@@ -634,9 +784,9 @@ function toggleMenu() {
     }
 }
 
-function toggleSidebar() { 
-    document.getElementById('side-panel').classList.add('open'); 
-    document.getElementById('overlay').style.display = 'block'; 
+function toggleSidebar() {
+    document.getElementById('side-panel').classList.add('open');
+    document.getElementById('overlay').style.display = 'block';
     setTimeout(() => {
         const activeItem = document.querySelector('.chapter-item.active');
         if (activeItem) {
@@ -645,7 +795,12 @@ function toggleSidebar() {
     }, 100);
 }
 
-function closePanels() { document.getElementById('side-panel').classList.remove('open'); document.getElementById('bottom-menu').classList.remove('open'); document.getElementById('reader-nav').classList.remove('hidden'); document.getElementById('overlay').style.display = 'none'; }
+function closePanels() {
+    document.getElementById('side-panel').classList.remove('open');
+    document.getElementById('bottom-menu').classList.remove('open');
+    document.getElementById('reader-nav').classList.remove('hidden');
+    document.getElementById('overlay').style.display = 'none';
+}
 
 function adjustFont(d) {
     const area = document.getElementById('reader-scroll-area');
@@ -685,7 +840,7 @@ function setupMenuSwipe() {
     const menu = document.getElementById('bottom-menu');
     menu.addEventListener('touchstart', (e) => {
         menuStartX = e.touches[0].clientX;
-    }, {passive: true});
+    }, { passive: true });
     menu.addEventListener('touchend', (e) => {
         const endX = e.changedTouches[0].clientX;
         const diff = menuStartX - endX;
@@ -693,36 +848,36 @@ function setupMenuSwipe() {
             if (diff > 0 && currentMenuIdx < 2) switchReaderMenu(currentMenuIdx + 1);
             else if (diff < 0 && currentMenuIdx > 0) switchReaderMenu(currentMenuIdx - 1);
         }
-    }, {passive: true});
+    }, { passive: true });
 }
 
 function setupSwipeInteractions() {
     setupMenuSwipe();
     const editSlider = document.getElementById('edit-slider');
     let editStartX = 0;
-    editSlider.addEventListener('touchstart', e => editStartX = e.touches[0].clientX, {passive: true});
+    editSlider.addEventListener('touchstart', e => editStartX = e.touches[0].clientX, { passive: true });
     editSlider.addEventListener('touchend', e => {
         let diff = editStartX - e.changedTouches[0].clientX;
         if (Math.abs(diff) > 50) {
             if (diff > 0) switchEditPage(1);
             else switchEditPage(0);
         }
-    }, {passive: true});
+    }, { passive: true });
     const recordCard = document.getElementById('record-card');
     let recStartX = 0;
-    recordCard.addEventListener('touchstart', e => recStartX = e.touches[0].clientX, {passive: true});
+    recordCard.addEventListener('touchstart', e => recStartX = e.touches[0].clientX, { passive: true });
     recordCard.addEventListener('touchend', e => {
         let diff = recStartX - e.changedTouches[0].clientX;
         if (Math.abs(diff) > 50) {
             if (diff > 0) nextRecordPage();
             else prevRecordPage();
         }
-    }, {passive: true});
+    }, { passive: true });
 }
 
 function applyFontURL() {
     const url = document.getElementById('font-url-input').value.trim();
-    if(!url) return;
+    if (!url) return;
     const style = document.createElement('style');
     style.innerHTML = `@font-face { font-family: 'CustomFont'; src: url('${url}'); }`;
     document.head.appendChild(style);
@@ -731,7 +886,7 @@ function applyFontURL() {
 
 function applyFontFile(e) {
     const file = e.target.files[0];
-    if(!file) return;
+    if (!file) return;
     const reader = new FileReader();
     reader.onload = (event) => {
         const style = document.createElement('style');
@@ -753,14 +908,14 @@ function setReaderBG(bg, text) {
 
 function applyBGURL() {
     const url = document.getElementById('bg-url-input').value.trim();
-    if(!url) return;
+    if (!url) return;
     const rv = document.getElementById('reader-view');
     rv.style.backgroundImage = `url('${url}')`;
 }
 
 function applyBGFile(e) {
     const file = e.target.files[0];
-    if(!file) return;
+    if (!file) return;
     const reader = new FileReader();
     reader.onload = (event) => {
         const rv = document.getElementById('reader-view');
@@ -772,18 +927,34 @@ function applyBGFile(e) {
 function updateBookInDB(book) { db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).put(book); }
 function saveCats() { localStorage.setItem('yy_cats_v22', JSON.stringify(categories)); }
 function closeModal(id) { document.getElementById(id).style.display = 'none'; tempCoverData = ""; }
-function openCatModal() { document.getElementById('cat-manager-list').innerHTML = categories.map((c, i) => `<li style="display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border-color); font-size: 0.9rem;">${c} <span style="color:#ff4444; font-weight:bold; cursor:pointer;" onclick="deleteCategory(${i})">删除</span></li>`).join(''); document.getElementById('cat-modal').style.display = 'flex'; }
-function addCategory() { const n = document.getElementById('new-cat-name').value.trim(); if (n && !categories.includes(n)) { categories.push(n); saveCats(); openCatModal(); renderCategoryBar(); } }
-function deleteCategory(i) { const d = categories.splice(i, 1)[0]; books.forEach(b => { if(b.category === d) { b.category = categories[0] || '其他'; updateBookInDB(b); } }); saveCats(); openCatModal(); renderCategoryBar(); renderBookshelf(); }
+
+function openCatModal() {
+    document.getElementById('cat-manager-list').innerHTML = categories.map((c, i) =>
+        `<li style="display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border-color); font-size: 0.9rem;">${c} <span style="color:#ff4444; font-weight:bold; cursor:pointer;" onclick="deleteCategory(${i})">删除</span></li>`).join('');
+    document.getElementById('cat-modal').style.display = 'flex';
+}
+
+function addCategory() {
+    const n = document.getElementById('new-cat-name').value.trim();
+    if (n && !categories.includes(n)) { categories.push(n); saveCats(); openCatModal(); renderCategoryBar(); }
+}
+
+function deleteCategory(i) {
+    const d = categories.splice(i, 1)[0];
+    books.forEach(b => { if (b.category === d) { b.category = categories[0] || '其他'; updateBookInDB(b); } });
+    saveCats(); openCatModal(); renderCategoryBar(); renderBookshelf();
+}
 
 function openEditModal(id) {
-    currentBookId = id; const b = books.find(x => x.id === id);
-    document.getElementById('edit-category').innerHTML = categories.map(c => `<option value="${c}" ${c===b.category?'selected':''}>${c}</option>`).join('');
+    currentBookId = id;
+    const b = books.find(x => x.id === id);
+    document.getElementById('edit-category').innerHTML = categories.map(c => `<option value="${c}" ${c === b.category ? 'selected' : ''}>${c}</option>`).join('');
     document.getElementById('edit-name').value = b.name;
     document.getElementById('edit-author').value = b.author || '';
     document.getElementById('edit-show-title').checked = b.showTitleOnCover !== false;
     document.getElementById('edit-notes').value = b.notes || '';
-    tempCoverData = b.cover; updatePreview(b.cover, b.name, b.showTitleOnCover !== false); 
+    tempCoverData = b.cover;
+    updatePreview(b.cover, b.name, b.showTitleOnCover !== false);
     switchEditPage(0);
     document.getElementById('edit-modal').style.display = 'flex';
 }
@@ -795,16 +966,81 @@ function switchEditPage(idx) {
     document.getElementById('dot-1').classList.toggle('active', idx === 1);
 }
 
-function handleCoverUpload(event) { const file = event.target.files[0]; if (!file) return; const reader = new FileReader(); reader.onload = (e) => { tempCoverData = e.target.result; updatePreview(tempCoverData, document.getElementById('edit-name').value, document.getElementById('edit-show-title').checked); }; reader.readAsDataURL(file); }
-function syncPreviewTitle(val) { updatePreview(tempCoverData, val, document.getElementById('edit-show-title').checked); }
-function updatePreview(src, title, show) { const preview = document.getElementById('edit-cover-preview'); preview.innerHTML = (src ? `<img src="${src}">` : "") + (show ? `<div class="cover-preview-text">${title.substring(0, 10)}</div>` : ""); }
-function openEditModalFromReader() { openEditModal(currentBookId); }
-function saveBookDetails() { const b = books.find(x => x.id === currentBookId); b.name = document.getElementById('edit-name').value; b.author = document.getElementById('edit-author').value; b.cover = tempCoverData; b.category = document.getElementById('edit-category').value; b.showTitleOnCover = document.getElementById('edit-show-title').checked; b.notes = document.getElementById('edit-notes').value; updateBookInDB(b); renderBookshelf(); if(document.getElementById('reader-view').style.display === 'block') { document.getElementById('reader-book-title').innerText = b.name; document.getElementById('reader-notes-display').innerText = b.notes || '无备注'; document.getElementById('side-title').innerText = b.name; const sAuthor = document.getElementById('side-author'); if (b.author) { sAuthor.innerText = b.author; sAuthor.style.display = 'block'; } else { sAuthor.style.display = 'none'; } } closeModal('edit-modal'); }
-function deleteBook() { if(confirm('确定移除此书吗？')){ db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).delete(currentBookId); books = books.filter(x => x.id !== currentBookId); renderBookshelf(); closeModal('edit-modal'); closeReader(); } }
-function handleSelection(e) { const s = window.getSelection(), m = document.getElementById('selection-menu'); if (s.toString().length > 0) { const r = s.getRangeAt(0).getBoundingClientRect(); m.style.display = 'block'; m.style.top = `${r.top + window.scrollY - 50}px`; m.style.left = `${r.left + r.width/2 - 60}px`; } else m.style.display = 'none'; }
-function annotate(c) { const s = window.getSelection(); if(!s.rangeCount) return; const r = s.getRangeAt(0), n = document.createElement('span'); n.className = c; r.surroundContents(n); const b = books.find(x => x.id === currentBookId); b.content = document.getElementById('reader-content').innerText; updateBookInDB(b); s.removeAllRanges(); document.getElementById('selection-menu').style.display = 'none'; }
-function openThemeModal() { document.getElementById('theme-modal').style.display = 'flex'; }
+function handleCoverUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        tempCoverData = e.target.result;
+        updatePreview(tempCoverData, document.getElementById('edit-name').value, document.getElementById('edit-show-title').checked);
+    };
+    reader.readAsDataURL(file);
+}
 
+function syncPreviewTitle(val) { updatePreview(tempCoverData, val, document.getElementById('edit-show-title').checked); }
+
+function updatePreview(src, title, show) {
+    const preview = document.getElementById('edit-cover-preview');
+    preview.innerHTML = (src ? `<img src="${src}">` : "") + (show ? `<div class="cover-preview-text">${title.substring(0, 10)}</div>` : "");
+}
+
+function openEditModalFromReader() { openEditModal(currentBookId); }
+
+function saveBookDetails() {
+    const b = books.find(x => x.id === currentBookId);
+    b.name = document.getElementById('edit-name').value;
+    b.author = document.getElementById('edit-author').value;
+    b.cover = tempCoverData;
+    b.category = document.getElementById('edit-category').value;
+    b.showTitleOnCover = document.getElementById('edit-show-title').checked;
+    b.notes = document.getElementById('edit-notes').value;
+    updateBookInDB(b);
+    renderBookshelf();
+    if (document.getElementById('reader-view').style.display === 'block') {
+        document.getElementById('reader-book-title').innerText = b.name;
+        document.getElementById('reader-notes-display').innerText = b.notes || '无备注';
+        document.getElementById('side-title').innerText = b.name;
+        const sAuthor = document.getElementById('side-author');
+        if (b.author) { sAuthor.innerText = b.author; sAuthor.style.display = 'block'; }
+        else { sAuthor.style.display = 'none'; }
+    }
+    closeModal('edit-modal');
+}
+
+function deleteBook() {
+    if (confirm('确定移除此书吗？')) {
+        db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).delete(currentBookId);
+        books = books.filter(x => x.id !== currentBookId);
+        renderBookshelf();
+        closeModal('edit-modal');
+        closeReader();
+    }
+}
+
+function handleSelection(e) {
+    const s = window.getSelection(), m = document.getElementById('selection-menu');
+    if (s.toString().length > 0) {
+        const r = s.getRangeAt(0).getBoundingClientRect();
+        m.style.display = 'block';
+        m.style.top = `${r.top + window.scrollY - 50}px`;
+        m.style.left = `${r.left + r.width / 2 - 60}px`;
+    } else m.style.display = 'none';
+}
+
+function annotate(c) {
+    const s = window.getSelection();
+    if (!s.rangeCount) return;
+    const r = s.getRangeAt(0), n = document.createElement('span');
+    n.className = c;
+    r.surroundContents(n);
+    const b = books.find(x => x.id === currentBookId);
+    b.content = document.getElementById('reader-content').innerText;
+    updateBookInDB(b);
+    s.removeAllRanges();
+    document.getElementById('selection-menu').style.display = 'none';
+}
+
+function openThemeModal() { document.getElementById('theme-modal').style.display = 'flex'; }
 
 // ── 发现页：拖拽导入 ──
 function handleDiscoverDrop(e) {
@@ -847,7 +1083,7 @@ function searchNotes(query) {
 
     const regex = new RegExp('(' + query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
     resultsDiv.innerHTML = hits.map(h => {
-        const highlighted = h.snippet.replace(regex, '<span style="background:var(--highlight-color); border-radius:2px;">$1</span>');
+        const highlighted = escapeHTML(h.snippet).replace(regex, '<span style="background:var(--highlight-color); border-radius:2px;">$1</span>');
         return `<div onclick="openReader(${h.bookId})" style="background:var(--card-bg); border:1px solid var(--border-color); border-radius:10px; padding:14px 16px; margin-bottom:10px; cursor:pointer;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                 <span style="font-size:0.85rem; font-weight:bold; color:var(--text-color);">${h.bookName}</span>
@@ -876,14 +1112,15 @@ async function exportBackup() {
             categories: JSON.parse(localStorage.getItem('yy_cats_v22') || '[]'),
             books: allBooks
         };
-        const blob = new Blob([JSON.stringify(backup)], { type: 'application/json' });
+        // 备份文件用 UTF-8 写出并加 BOM，避免再被误判编码
+        const blob = new Blob(['\uFEFF' + JSON.stringify(backup)], { type: 'application/json;charset=utf-8' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = '藏书馆备份_' + new Date().toLocaleDateString('zh-CN').replace(/\//g, '-') + '.cangshuguan';
         a.click();
         URL.revokeObjectURL(a.href);
         toastEl.textContent = '✓ 备份已导出';
-    } catch(e) {
+    } catch (e) {
         toastEl.textContent = '导出失败：' + e.message;
     }
     setTimeout(() => { toastEl.style.display = 'none'; }, 2500);
@@ -897,8 +1134,10 @@ async function importBackup(event) {
     toastEl.style.display = 'block';
     toastEl.textContent = '正在读取备份…';
     try {
-        const text = await file.text();
-        const backup = JSON.parse(text);
+        // 备份文件同样走编码探测，兼容旧版本导出的文件
+        const buffer = await readFileAsBuffer(file);
+        const { text } = detectAndDecode(buffer);
+        const backup = JSON.parse(text.replace(/^\uFEFF/, ''));
         if (!backup.books || !Array.isArray(backup.books)) throw new Error('备份文件格式错误');
 
         // 合并分类（不重复）
@@ -924,11 +1163,13 @@ async function importBackup(event) {
         renderCategoryBar();
         renderBookshelf();
         toastEl.textContent = `✓ 已导入 ${added} 本书籍`;
-    } catch(e) {
+    } catch (e) {
         toastEl.textContent = '导入失败：' + e.message;
     }
     event.target.value = '';
     setTimeout(() => { toastEl.style.display = 'none'; }, 3000);
 }
 
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (localStorage.getItem('yy_theme_v22') === 'auto') applyTheme('auto'); });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (localStorage.getItem('yy_theme_v22') === 'auto') applyTheme('auto');
+});

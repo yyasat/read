@@ -22,10 +22,10 @@
     --highlight-color: #4a4516;
 }
 
-* { 
-    margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; 
-    -webkit-touch-callout: none; -webkit-user-select: none; -khtml-user-select: none; 
-    -moz-user-select: none; -ms-user-select: none; user-select: none; 
+* {
+    margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none; -webkit-user-select: none; -khtml-user-select: none;
+    -moz-user-select: none; -ms-user-select: none; user-select: none;
 }
 
 input, textarea, #reader-content { -webkit-user-select: text; user-select: text; }
@@ -84,13 +84,13 @@ header {
 .search-result-item:last-child { border-bottom: none; }
 .search-highlight { background: var(--highlight-color); color: #000; padding: 0 2px; border-radius: 2px; font-weight: bold; }
 
-/* ── 书架：网格布局 ── */
+/* ── 书架：三列网格 ── */
 #bookshelf {
     width: 100%;
     max-width: 100%;
     padding: 6px 0 100px;
     display: grid;
-    /* minmax(0, 1fr) 是关键：1fr 的默认下限是 min-content，长书名会把列宽顶爆 */
+    /* minmax(0, 1fr) 是关键：1fr 默认下限为 min-content，长书名会顶爆列宽 */
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 26px 14px;
 }
@@ -132,6 +132,22 @@ header {
     padding: 4px 6px;
     border-radius: 3px;
     box-shadow: 1px 2px 5px rgba(0,0,0,0.2);
+}
+
+.book-garbled-tip {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    z-index: 3;
+    font-size: 0.5rem;
+    line-height: 1;
+    font-weight: bold;
+    color: #fff;
+    background: #e04b4b;
+    padding: 4px 5px;
+    border-radius: 3px;
+    box-shadow: 1px 2px 5px rgba(0,0,0,0.25);
+    letter-spacing: 0;
 }
 
 .book-cover {
