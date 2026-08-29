@@ -1,9 +1,19 @@
-document.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+/* ═══════════════════════════════════════════════════════════
+   数据分层：
+   - books 存储：{ id, name, content, rawFile, encoding }  ← 重，只按 id 单条取
+   - meta  存储：书架/搜索/进度需要的全部轻量字段          ← 启动只读这个
+   内存里的 books[] 数组从此只装 meta，不再驻留任何正文。
+   ═══════════════════════════════════════════════════════════ */
 
 let db;
 const DB_NAME = "YanYeDB_Precision_V22";
 const STORE_NAME = "books";
-let books = [];
+const META_STORE = "meta";
+const DB_VERSION = 3;
+
+let books = [];   // 只含 meta
 let categories = JSON.parse(localStorage.getItem('yy_cats_v22')) || ['文学', '随笔', '其他'];
 let currentBookId = null;
 let currentFilter = '全部';
@@ -11,16 +21,12 @@ let tempCoverData = "";
 let menuStartX = 0;
 let currentMenuIdx = 0;
 let searchClickTimer = null;
-let loadingTimer = null;
 let searchReturnTimeout = null;
 let recordTouchY = 0;
 let recordTouchTime = 0;
 let recordPageIndex = 0;
 
-/* ═══════════ 阅读器状态 ═══════════
-   chapters 只存 {title, from, to} 偏移量，正文按需从 bookContent 切片，
-   避免把整本书再复制一份。DOM 里只保留 loadedStart..loadedEnd 这一段章节。
-   ══════════════════════════════════ */
+/* ═══════════ 阅读器状态 ═══════════ */
 let bookContent = "";
 let chapters = [];
 let currentChapterIdx = 0;
@@ -30,10 +36,13 @@ let tocRendered = false;
 let progressSaveTimer = null;
 let seekTimer = null;
 let isAdjusting = false;
+let loadingAborted = false;
 
-const WINDOW_MAX = 7;      // DOM 中最多保留的章节数
+const WINDOW_MAX = 7;      // DOM 中最多保留的章节块数
 const EDGE_PX = 1200;      // 距上/下边缘多少像素开始续载
-const HEADER_OFFSET = 80;  // 顶栏遮挡高度，判定「当前章」用
+const HEADER_OFFSET = 80;  // 顶栏遮挡高度
+const MAX_BLOCK = 20000;   // 单个渲染块最大字数，超长章节按此切块
+const DOUBLE_TAP_MS = 200; // 双击判定窗口，直接决定单击打开的延迟
 
 const quotes = [
     "马上到达书籍世界...",
@@ -51,20 +60,95 @@ const themeIcons = {
     auto: `<svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>`
 };
 
-/* 数据库版本 2：rawFile 存原始字节，用于随时切换编码重新解码 */
-const request = indexedDB.open(DB_NAME, 2);
+/* ═══════════ IndexedDB 基础设施 ═══════════ */
+
+function txStore(name, mode) {
+    return db.transaction([name], mode).objectStore(name);
+}
+
+function idbReq(req) {
+    return new Promise((res, rej) => {
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+    });
+}
+
+let needMigrate = false;
+
+const request = indexedDB.open(DB_NAME, DB_VERSION);
 request.onupgradeneeded = (e) => {
-    db = e.target.result;
-    if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME, { keyPath: "id" });
+    const _db = e.target.result;
+    if (!_db.objectStoreNames.contains(STORE_NAME)) _db.createObjectStore(STORE_NAME, { keyPath: "id" });
+    if (!_db.objectStoreNames.contains(META_STORE)) {
+        _db.createObjectStore(META_STORE, { keyPath: "id" });
+        needMigrate = e.oldVersion > 0;   // 老库才需要迁移，全新安装不用
+    }
 };
-request.onsuccess = (e) => { db = e.target.result; loadBooksFromDB(); };
+request.onsuccess = async (e) => {
+    db = e.target.result;
+    try {
+        if (needMigrate) await migrateToMeta();
+        books = await idbReq(txStore(META_STORE, 'readonly').getAll());
+    } catch (err) {
+        books = [];
+    }
+    init();
+};
 request.onerror = () => { alert('数据库打开失败，请检查浏览器是否允许本地存储。'); };
 
-function loadBooksFromDB() {
-    const store = db.transaction([STORE_NAME], "readonly").objectStore(STORE_NAME);
-    const getAll = store.getAll();
-    getAll.onsuccess = () => { books = getAll.result; init(); };
+/* 老版本一次性迁移：用游标逐本读，避免一次把整库拉进内存 */
+function migrateToMeta() {
+    return new Promise((resolve) => {
+        const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
+        const metaStore = tx.objectStore(META_STORE);
+        const cursorReq = tx.objectStore(STORE_NAME).openCursor();
+        cursorReq.onsuccess = (ev) => {
+            const cur = ev.target.result;
+            if (!cur) return;
+            metaStore.put(buildMeta(cur.value));
+            cur.continue();
+        };
+        tx.oncomplete = resolve;
+        tx.onerror = resolve;
+        tx.onabort = resolve;
+    });
 }
+
+/* 从完整记录里抽出 meta */
+function buildMeta(book) {
+    const content = book.content || '';
+    return {
+        id: book.id,
+        name: book.name || '未命名',
+        author: book.author || '',
+        category: book.category || (categories[0] || '其他'),
+        cover: book.cover || '',
+        showTitleOnCover: book.showTitleOnCover !== false,
+        notes: book.notes || '',
+        recordCards: book.recordCards || [],
+        lastReadChapterIdx: book.lastReadChapterIdx || 0,
+        lastReadChapterTitle: book.lastReadChapterTitle || '',
+        lastReadChapterRatio: book.lastReadChapterRatio || 0,
+        encoding: book.encoding || '',
+        hasRaw: !!book.rawFile,
+        charCount: content.length,
+        garbled: isGarbled(content)
+    };
+}
+
+function saveMeta(meta) {
+    if (!db || !meta) return;
+    txStore(META_STORE, 'readwrite').put(meta);
+}
+
+// 兼容旧调用名
+function updateBookInDB(meta) { saveMeta(meta); }
+
+function getBookRecord(id) {
+    return idbReq(txStore(STORE_NAME, 'readonly').get(id));
+}
+
+/* ═══════════ 初始化 / 主题 ═══════════ */
 
 function init() {
     const sz = localStorage.getItem('yy_font_size_v22');
@@ -81,7 +165,8 @@ function setTheme(mode) { localStorage.setItem('yy_theme_v22', mode); applyTheme
 function applyTheme(mode) {
     const root = document.documentElement;
     document.querySelectorAll('.theme-opt').forEach(opt => opt.classList.remove('active'));
-    if (document.getElementById(`opt-${mode}`)) document.getElementById(`opt-${mode}`).classList.add('active');
+    const optEl = document.getElementById(`opt-${mode}`);
+    if (optEl) optEl.classList.add('active');
     document.getElementById('theme-trigger').innerHTML = themeIcons[mode];
     if (mode === 'auto') {
         const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -94,8 +179,7 @@ function switchTab(tab) {
     document.getElementById('tab-discover').style.display = tab === 'discover' ? 'block' : 'none';
     document.getElementById('tab-about').style.display = tab === 'about' ? 'block' : 'none';
 
-    const navs = document.querySelectorAll('.nav-btn');
-    navs.forEach((n, idx) => {
+    document.querySelectorAll('.nav-btn').forEach((n, idx) => {
         const isMatch = (tab === 'archive' && idx === 0) || (tab === 'discover' && idx === 1) || (tab === 'about' && idx === 2);
         n.classList.toggle('active', isMatch);
     });
@@ -104,7 +188,7 @@ function switchTab(tab) {
 function renderCategoryBar() {
     const bar = document.getElementById('category-bar');
     let html = `<span class="cat-item ${currentFilter === '全部' ? 'active' : ''}" onclick="filterCategory('全部')">全部</span>`;
-    categories.forEach(cat => html += `<span class="cat-item ${currentFilter === cat ? 'active' : ''}" onclick="filterCategory('${cat}')">${cat}</span>`);
+    categories.forEach(cat => html += `<span class="cat-item ${currentFilter === cat ? 'active' : ''}" onclick="filterCategory('${cat}')">${escapeHTML(cat)}</span>`);
     bar.innerHTML = html;
 }
 
@@ -135,38 +219,35 @@ function renderBookshelf() {
         card.addEventListener('touchend', (e) => {
             const diffY = recordTouchY - e.changedTouches[0].clientY;
             const diffTime = Date.now() - recordTouchTime;
-            if (diffTime > 400 && diffY > 40) {
-                openRecordCard(book.id);
-            }
+            if (diffTime > 400 && diffY > 40) openRecordCard(book.id);
         }, { passive: true });
 
         card.onclick = () => {
             const now = Date.now();
-            if (now - lastClick < 300) {
+            if (now - lastClick < DOUBLE_TAP_MS) {
                 clearTimeout(card.clickTimer);
                 openEditModal(book.id);
             } else {
-                card.clickTimer = setTimeout(() => {
-                    openReader(book.id);
-                }, 300);
+                card.clickTimer = setTimeout(() => openReader(book.id), DOUBLE_TAP_MS);
             }
             lastClick = now;
         };
 
         card.oncontextmenu = (e) => { e.preventDefault(); };
+
         const showTitle = book.showTitleOnCover !== false;
         const lastRead = book.lastReadChapterTitle ? `上次读到：${book.lastReadChapterTitle}` : '从未读过';
-        const garbledFlag = isGarbled(book.content) ? `<div class="book-garbled-tip" onclick="event.stopPropagation(); showGarbledHelp(${book.id})">编码异常</div>` : '';
+        const garbledFlag = book.garbled ? `<div class="book-garbled-tip" onclick="event.stopPropagation(); showGarbledHelp(${book.id})">编码异常</div>` : '';
         card.innerHTML = `
             <div class="book-cover-wrap">
                 <div class="book-index">${idx}</div>
                 ${garbledFlag}
-                <div class="book-cover">${book.cover ? `<img src="${book.cover}" class="book-cover-img">` : ''}${showTitle ? `<div class="book-cover-text">${escapeHTML(book.name.substring(0, 12))}</div>` : ''}</div>
+                <div class="book-cover">${book.cover ? `<img src="${book.cover}" class="book-cover-img" loading="lazy" decoding="async">` : ''}${showTitle ? `<div class="book-cover-text">${escapeHTML(book.name.substring(0, 12))}</div>` : ''}</div>
             </div>
             <div class="book-info">
                 <h3>${escapeHTML(book.name)}</h3>
                 <div class="book-last-read">${escapeHTML(lastRead)}</div>
-                <div class="book-meta"><span class="book-tag">${escapeHTML(book.category)}</span><span>${Math.round((book.content || '').length / 1000)}k 字</span></div>
+                <div class="book-meta"><span class="book-tag">${escapeHTML(book.category)}</span><span>${Math.round((book.charCount || 0) / 1000)}k 字</span></div>
             </div>
         `;
         frag.appendChild(card);
@@ -186,8 +267,8 @@ function isGarbled(text) {
 }
 
 function showGarbledHelp(id) {
-    const book = books.find(b => b.id === id);
-    if (book && book.rawFile) {
+    const meta = books.find(b => b.id === id);
+    if (meta && meta.hasRaw) {
         if (confirm('检测到这本书解码有误。\n\n原始文件已保存，可以直接用 GBK 重新解码，不用删书重导。要现在试一下吗？')) {
             reDecodeBook(id, 'gb18030');
         }
@@ -195,6 +276,8 @@ function showGarbledHelp(id) {
     }
     alert('这本书是旧版本导入的，没有保存原始文件字节，无法就地修复。\n\n请双击此书 → 移除此书，然后重新导入同一个 TXT。新版本会自动识别 GBK。');
 }
+
+/* ═══════════ 书架搜索 ═══════════ */
 
 function handleSearch(query) {
     const panel = document.getElementById('search-panel');
@@ -208,10 +291,7 @@ function handleSearch(query) {
         return;
     }
 
-    if (searchReturnTimeout) {
-        clearTimeout(searchReturnTimeout);
-        searchReturnTimeout = null;
-    }
+    if (searchReturnTimeout) { clearTimeout(searchReturnTimeout); searchReturnTimeout = null; }
 
     if (!searchContainer.classList.contains('searching')) {
         const rect = searchContainer.getBoundingClientRect();
@@ -225,9 +305,7 @@ function handleSearch(query) {
             searchContainer.style.backgroundColor = 'var(--bg-color)';
         });
 
-        setTimeout(() => {
-            panel.classList.add('open');
-        }, 800);
+        setTimeout(() => panel.classList.add('open'), 800);
     }
 
     const matched = books.filter(b => b.name.toLowerCase().includes(query.toLowerCase()));
@@ -239,7 +317,7 @@ function handleSearch(query) {
             return `
                 <div class="search-result-item" onclick="handleSearchResultClick(${b.id})">
                     <div style="width:35px; height:45px; background:var(--panel-bg); flex-shrink:0; border:1px solid var(--border-color); overflow:hidden;">
-                        ${b.cover ? `<img src="${b.cover}" style="width:100%; height:100%; object-fit:cover;">` : ''}
+                        ${b.cover ? `<img src="${b.cover}" style="width:100%; height:100%; object-fit:cover;" loading="lazy">` : ''}
                     </div>
                     <div>
                         <div style="font-weight:bold; font-size:0.95rem;">${highlightedName}</div>
@@ -259,7 +337,7 @@ function handleSearchResultClick(id) {
         searchClickTimer = setTimeout(() => {
             jumpToBook(id);
             searchClickTimer = null;
-        }, 300);
+        }, DOUBLE_TAP_MS);
     } else {
         clearTimeout(searchClickTimer);
         searchClickTimer = null;
@@ -271,9 +349,7 @@ function handleSearchResultClick(id) {
 function jumpToBook(id) {
     const book = books.find(b => b.id === id);
     if (!book) return;
-    if (currentFilter !== '全部' && book.category !== currentFilter) {
-        filterCategory('全部');
-    }
+    if (currentFilter !== '全部' && book.category !== currentFilter) filterCategory('全部');
     closeSearch();
     setTimeout(() => {
         const card = document.getElementById('book-card-' + id);
@@ -314,19 +390,7 @@ function closeSearch(clearInput = true) {
 
 /* ═══════════════════════════════════════════
    编码识别
-   FileReader.readAsText(file, '编码名') 走浏览器传统解码路径，
-   兼容性比 TextDecoder 好，老版 Android WebView 上更可靠。
-   TextDecoder 只负责 BOM 和严格 UTF-8 校验。
    ═══════════════════════════════════════════ */
-
-const ENCODING_LABELS = {
-    'gb18030': '简体中文 GBK / GB18030',
-    'gbk': '简体中文 GBK',
-    'big5': '繁体中文 BIG5',
-    'utf-8': 'UTF-8',
-    'utf-16le': 'UTF-16 LE',
-    'utf-16be': 'UTF-16 BE'
-};
 
 function scoreDecoded(text) {
     let bad = 0, cjk = 0, ctrl = 0;
@@ -354,7 +418,7 @@ function readBlobAsText(blob, encoding) {
     return new Promise((resolve) => {
         const reader = new FileReader();
         reader.onload = (e) => resolve(e.target.result);
-        reader.        onerror = () => resolve(null);
+        reader.onerror = () => resolve(null);
         try {
             reader.readAsText(blob, encoding);
         } catch (err) {
@@ -363,18 +427,12 @@ function readBlobAsText(blob, encoding) {
     });
 }
 
-// 有没有 BOM，顺便判断是不是合法 UTF-8
+// 探测 BOM，顺便判断是不是合法 UTF-8
 function inspectBytes(buffer) {
     const bytes = new Uint8Array(buffer);
-    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
-        return { bom: 'utf-8' };
-    }
-    if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
-        return { bom: 'utf-16le' };
-    }
-    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
-        return { bom: 'utf-16be' };
-    }
+    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return { bom: 'utf-8' };
+    if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) return { bom: 'utf-16le' };
+    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) return { bom: 'utf-16be' };
     try {
         new TextDecoder('utf-8', { fatal: true }).decode(buffer);
         return { bom: null, strictUtf8: true };
@@ -383,15 +441,15 @@ function inspectBytes(buffer) {
     }
 }
 
+/* 候选编码只在前 256KB 上试解码，大文件不用整本跑一遍 */
 async function detectAndDecode(blob) {
-    const buffer = await readFileAsBuffer(blob);
+    const probe = blob.size > 262144 ? blob.slice(0, 262144) : blob;
+    const buffer = await readFileAsBuffer(probe);
     const info = inspectBytes(buffer);
 
     if (info.bom) {
         const text = await readBlobAsText(blob, info.bom);
-        if (text !== null) {
-            return { text: text.replace(/^\uFEFF/, ''), encoding: info.bom };
-        }
+        if (text !== null) return { text: text.replace(/^\uFEFF/, ''), encoding: info.bom };
     }
 
     if (info.strictUtf8) {
@@ -402,10 +460,10 @@ async function detectAndDecode(blob) {
     const candidates = ['gb18030', 'gbk', 'big5', 'utf-8'];
     const results = [];
     for (const enc of candidates) {
-        const text = await readBlobAsText(blob, enc);
-        if (text === null || text === '') continue;
-        const s = scoreDecoded(text);
-        results.push({ encoding: enc, text, bad: s.bad, cjk: s.cjk });
+        const t = await readBlobAsText(probe, enc);
+        if (t === null || t === '') continue;
+        const s = scoreDecoded(t);
+        results.push({ encoding: enc, bad: s.bad, cjk: s.cjk });
     }
 
     if (results.length === 0) {
@@ -419,37 +477,44 @@ async function detectAndDecode(blob) {
         if (c.bad < best.bad) best = c;
         else if (c.bad === best.bad && c.cjk > best.cjk) best = c;
     }
-    return { text: best.text, encoding: best.encoding };
+    const full = await readBlobAsText(blob, best.encoding);
+    return { text: (full || '').replace(/^\uFEFF/, ''), encoding: best.encoding };
 }
 
 /* 用指定编码重新解码已入库的书 */
 async function reDecodeBook(id, encoding) {
-    const book = books.find(b => b.id === id);
-    if (!book) return;
-    if (!book.rawFile) {
+    const meta = books.find(b => b.id === id);
+    if (!meta) return;
+    const record = await getBookRecord(id);
+    if (!record || !record.rawFile) {
         alert('这本书没有保存原始文件，无法重新解码。请移除后重新导入。');
         return;
     }
     try {
         let text;
         if (encoding === 'auto') {
-            const r = await detectAndDecode(book.rawFile);
+            const r = await detectAndDecode(record.rawFile);
             text = r.text;
-            book.encoding = r.encoding;
+            record.encoding = r.encoding;
         } else {
-            text = await readBlobAsText(book.rawFile, encoding);
+            text = await readBlobAsText(record.rawFile, encoding);
             if (text === null) throw new Error('该编码不被当前浏览器支持');
-            book.encoding = encoding;
+            record.encoding = encoding;
         }
-        book.content = text.replace(/^\uFEFF/, '');
-        book.lastReadChapterIdx = 0;
-        book.lastReadChapterTitle = '';
-        book.lastReadChapterRatio = 0;
-        book.lastReadOffset = 0;
-        updateBookInDB(book);
+        record.content = text.replace(/^\uFEFF/, '');
+        txStore(STORE_NAME, 'readwrite').put(record);
+
+        meta.encoding = record.encoding;
+        meta.charCount = record.content.length;
+        meta.garbled = isGarbled(record.content);
+        meta.lastReadChapterIdx = 0;
+        meta.lastReadChapterTitle = '';
+        meta.lastReadChapterRatio = 0;
+        saveMeta(meta);
+
         renderBookshelf();
-        syncEncodingUI(book);
-        toast(isGarbled(book.content) ? `${book.encoding} 解码后仍有乱码，换一个试试` : `✓ 已用 ${book.encoding} 重新解码`);
+        syncEncodingUI(meta);
+        toast(meta.garbled ? `${meta.encoding} 解码后仍有乱码，换一个试试` : `✓ 已用 ${meta.encoding} 重新解码`);
     } catch (e) {
         toast('重新解码失败：' + e.message);
     }
@@ -495,18 +560,18 @@ function ensureEncodingUI() {
     anchor.parentNode.insertBefore(section, anchor.nextSibling);
 }
 
-function syncEncodingUI(book) {
+function syncEncodingUI(meta) {
     const sel = document.getElementById('edit-encoding');
     const hint = document.getElementById('encoding-hint');
     if (!sel || !hint) return;
-    const cur = (book.encoding || '').toLowerCase();
+    const cur = (meta.encoding || '').toLowerCase();
     sel.value = ['gb18030', 'big5', 'utf-8', 'utf-16le'].includes(cur) ? cur : 'auto';
-    if (!book.rawFile) {
+    if (!meta.hasRaw) {
         hint.textContent = '这本书导入时没有保存原始文件，无法重新解码。移除后重新导入即可获得此功能。';
         sel.disabled = true;
     } else {
         sel.disabled = false;
-        hint.textContent = `当前编码：${book.encoding || '未知'}。若正文是乱码，换一个编码重新解码（阅读进度会重置）。`;
+        hint.textContent = `当前编码：${meta.encoding || '未知'}。若正文是乱码，换一个编码重新解码（阅读进度会重置）。`;
     }
 }
 
@@ -518,58 +583,60 @@ async function importFiles(event) {
     for (const file of files) {
         try {
             const { text, encoding } = await detectAndDecode(file);
-            const newBook = {
-                id: Date.now() + Math.random(),
+            const id = Date.now() + Math.random();
+            const record = {
+                id,
                 name: file.name.replace(/\.[^/.]+$/, ""),
-                author: "",
                 content: text,
-                encoding: encoding,
-                rawFile: file,
+                encoding,
+                rawFile: file
+            };
+            const meta = {
+                id,
+                name: record.name,
+                author: "",
                 category: categories[0] || '其他',
                 cover: '',
                 showTitleOnCover: true,
-                annotations: [],
+                notes: "",
+                recordCards: [],
                 lastReadChapterIdx: 0,
                 lastReadChapterTitle: "",
                 lastReadChapterRatio: 0,
-                lastReadOffset: 0,
-                notes: "",
-                recordCards: []
+                encoding,
+                hasRaw: true,
+                charCount: text.length,
+                garbled: isGarbled(text)
             };
-            books.push(newBook);
-            db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).add(newBook);
-            report.push({ name: newBook.name, encoding, garbled: isGarbled(text) });
+            const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
+            tx.objectStore(STORE_NAME).add(record);
+            tx.objectStore(META_STORE).add(meta);
+            books.push(meta);
+            report.push({ name: meta.name, encoding, garbled: meta.garbled });
         } catch (err) {
             report.push({ name: file.name, encoding: '读取失败', garbled: true });
         }
     }
     renderBookshelf();
-    event.target.value = '';
+    if (event.target && 'value' in event.target) event.target.value = '';
 
     if (report.length) {
         const bad = report.filter(r => r.garbled);
-        if (bad.length) {
-            toast(`导入 ${report.length} 本，${bad.length} 本仍有乱码，双击该书手动选编码`);
-        } else {
-            toast(`✓ 已导入 ${report.length} 本 · 编码 ${report[0].encoding}`);
-        }
+        if (bad.length) toast(`导入 ${report.length} 本，${bad.length} 本仍有乱码，双击该书手动选编码`);
+        else toast(`✓ 已导入 ${report.length} 本 · 编码 ${report[0].encoding}`);
     }
 }
 
 function escapeHTML(str) {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /* ═══════════════════════════════════════════
    阅读器：章节窗口化渲染
-   一次只把当前章前后各一章放进 DOM，滚到边缘再续接，
-   超过 WINDOW_MAX 章就从另一头卸掉并补偿 scrollTop。
+   parseChapters 产出的每个块都保证不超过 MAX_BLOCK 字，
+   没有章节标记的整本书也会被切成可分批渲染的小块。
    ═══════════════════════════════════════════ */
 
-// 只扫一遍全文，记录每章在 content 里的起止下标，不复制字符串
 function parseChapters(text) {
     const re = /第[零一二三四五六七八九十百千万两\d]{1,12}[章节回部集卷篇]|Chapter\s*\d+/gi;
     const marks = [];
@@ -579,26 +646,48 @@ function parseChapters(text) {
         if (re.lastIndex === m.index) re.lastIndex++;
     }
 
-    const list = [];
+    const raw = [];
     const firstStart = marks.length ? marks[0] : text.length;
     if (text.slice(0, Math.min(firstStart, 4000)).trim().length > 0) {
-        list.push({ title: '正文开始', from: 0, to: firstStart });
+        raw.push({ title: '正文开始', from: 0, to: firstStart });
     }
     for (let i = 0; i < marks.length; i++) {
         const from = marks[i];
         const to = (i + 1 < marks.length) ? marks[i + 1] : text.length;
         if (to - from < 2) continue;
-        list.push({ title: '', from, to });
+        raw.push({ title: '', from, to });
     }
-    if (list.length === 0) list.push({ title: '正文', from: 0, to: text.length });
+    if (raw.length === 0) raw.push({ title: '正文', from: 0, to: text.length });
 
-    list.forEach((c, i) => {
+    raw.forEach((c, i) => {
         if (!c.title) {
             const head = text.slice(c.from, Math.min(c.to, c.from + 120));
             const line = head.split(/\r?\n/)[0].trim();
             c.title = line ? line.slice(0, 40) : `第 ${i} 节`;
         }
     });
+
+    // 超长块二次切分，切点尽量落在换行处
+    const list = [];
+    for (const c of raw) {
+        const len = c.to - c.from;
+        if (len <= MAX_BLOCK) { list.push(c); continue; }
+        const parts = Math.ceil(len / MAX_BLOCK);
+        let cursor = c.from;
+        for (let p = 0; p < parts && cursor < c.to; p++) {
+            let end = Math.min(c.to, cursor + MAX_BLOCK);
+            if (end < c.to) {
+                const nl = text.lastIndexOf('\n', end);
+                if (nl > cursor + MAX_BLOCK * 0.5) end = nl + 1;
+            }
+            list.push({
+                title: p === 0 ? c.title : `${c.title} (${p + 1})`,
+                from: cursor,
+                to: end
+            });
+            cursor = end;
+        }
+    }
     return list;
 }
 
@@ -610,7 +699,6 @@ function chapterHTML(i) {
         + `</div>`;
 }
 
-// 以 centerIdx 为中心重建窗口（前后各一章）
 function renderWindow(centerIdx) {
     const container = document.getElementById('reader-content');
     loadedStart = Math.max(0, centerIdx - 1);
@@ -618,6 +706,15 @@ function renderWindow(centerIdx) {
     let html = '';
     for (let i = loadedStart; i <= loadedEnd; i++) html += chapterHTML(i);
     container.innerHTML = html;
+    currentChapterIdx = centerIdx;
+}
+
+// 首屏只渲染当前块，前一块延后补，首帧更快
+function renderFirstBlock(centerIdx) {
+    const container = document.getElementById('reader-content');
+    loadedStart = centerIdx;
+    loadedEnd = centerIdx;
+    container.innerHTML = chapterHTML(centerIdx);
     currentChapterIdx = centerIdx;
 }
 
@@ -671,7 +768,6 @@ function trimBottom() {
     }
 }
 
-// 章节太短时补足，保证内容高过一屏，否则没法滚动去触发续载
 function fillViewport() {
     const area = document.getElementById('reader-scroll-area');
     let guard = 0;
@@ -681,63 +777,78 @@ function fillViewport() {
     }
 }
 
-function openReader(id) {
+/* 点开一本书：只按 id 取这一条记录，正文不进 books[] */
+async function openReader(id) {
     const loader = document.getElementById('loading-overlay');
     const quoteText = document.getElementById('loading-quote-text');
+    loadingAborted = false;
     loader.style.display = 'flex';
     loader.style.opacity = '1';
     quoteText.innerText = quotes[Math.floor(Math.random() * quotes.length)];
 
-    // 先让转圈画出来，再做重活
-    loadingTimer = setTimeout(() => {
-        const book = books.find(b => b.id === id);
-        if (!book) { abortLoading(); return; }
-        currentBookId = id;
+    const meta = books.find(b => b.id === id);
+    if (!meta) { abortLoading(); return; }
+    currentBookId = id;
 
-        document.getElementById('reader-book-title').innerText = book.name;
-        document.getElementById('reader-notes-display').innerText = book.notes || '无备注';
-        document.getElementById('side-title').innerText = book.name;
-        const sAuthor = document.getElementById('side-author');
-        if (book.author) { sAuthor.innerText = book.author; sAuthor.style.display = 'block'; }
-        else { sAuthor.style.display = 'none'; }
+    let record;
+    try {
+        record = await getBookRecord(id);
+    } catch (e) {
+        toast('读取书籍失败');
+        abortLoading();
+        return;
+    }
+    if (loadingAborted) return;
+    if (!record) { toast('书籍内容丢失'); abortLoading(); return; }
 
-        bookContent = book.content || '';
-        chapters = parseChapters(bookContent);
-        tocRendered = false;
-        document.getElementById('toc-list').innerHTML =
-            '<div style="padding:20px 25px; opacity:0.4; font-size:0.85rem;">目录准备中…</div>';
+    document.getElementById('reader-book-title').innerText = meta.name;
+    document.getElementById('reader-notes-display').innerText = meta.notes || '无备注';
+    document.getElementById('side-title').innerText = meta.name;
+    const sAuthor = document.getElementById('side-author');
+    if (meta.author) { sAuthor.innerText = meta.author; sAuthor.style.display = 'block'; }
+    else { sAuthor.style.display = 'none'; }
 
-        const startIdx = Math.min(Math.max(book.lastReadChapterIdx || 0, 0), chapters.length - 1);
-        const startRatio = typeof book.lastReadChapterRatio === 'number' ? book.lastReadChapterRatio : 0;
+    bookContent = record.content || '';
+    chapters = parseChapters(bookContent);
+    tocRendered = false;
+    document.getElementById('toc-list').innerHTML =
+        '<div style="padding:20px 25px; opacity:0.4; font-size:0.85rem;">目录准备中…</div>';
 
-        renderWindow(startIdx);
+    const startIdx = Math.min(Math.max(meta.lastReadChapterIdx || 0, 0), chapters.length - 1);
+    const startRatio = typeof meta.lastReadChapterRatio === 'number' ? meta.lastReadChapterRatio : 0;
 
-        document.getElementById('home-view').style.display = 'none';
-        document.getElementById('reader-view').style.display = 'block';
+    renderFirstBlock(startIdx);
 
-        requestAnimationFrame(() => {
-            const area = document.getElementById('reader-scroll-area');
-            const w = getWrapper(startIdx);
-            if (w) {
-                area.scrollTop = Math.max(0, w.offsetTop + startRatio * w.offsetHeight - HEADER_OFFSET);
+    document.getElementById('home-view').style.display = 'none';
+    document.getElementById('reader-view').style.display = 'block';
+
+    requestAnimationFrame(() => {
+        const area = document.getElementById('reader-scroll-area');
+        const w = getWrapper(startIdx);
+        if (w) area.scrollTop = Math.max(0, w.offsetTop + startRatio * w.offsetHeight - HEADER_OFFSET);
+        updateActiveChapterUI(startIdx, false);
+        updateProgressBars();
+
+        loader.style.opacity = '0';
+        setTimeout(() => {
+            if (loader.style.opacity === '0') {
+                loader.style.display = 'none';
+                loader.style.opacity = '1';
             }
-            fillViewport();
-            updateActiveChapterUI(startIdx, false);
-            updateProgressBars();
+        }, 200);
 
-            loader.style.opacity = '0';
-            setTimeout(() => {
-                if (loader.style.opacity === '0') {
-                    loader.style.display = 'none';
-                    loader.style.opacity = '1';
-                }
-            }, 200);
-        });
-    }, 16);
+        // 首屏已可读，剩下的窗口在空闲时补齐
+        setTimeout(() => {
+            if (document.getElementById('reader-view').style.display !== 'block') return;
+            prependPrev();
+            fillViewport();
+            updateProgressBars();
+        }, 60);
+    });
 }
 
 function abortLoading() {
-    if (loadingTimer) clearTimeout(loadingTimer);
+    loadingAborted = true;
     const loader = document.getElementById('loading-overlay');
     loader.style.display = 'none';
     loader.style.opacity = '1';
@@ -798,19 +909,18 @@ function currentChapterRatio() {
     return Math.max(0, Math.min(1, r));
 }
 
-// 进度写库限流，避免滚动时高频事务
 function scheduleProgressSave() {
     clearTimeout(progressSaveTimer);
     progressSaveTimer = setTimeout(saveProgressNow, 600);
 }
 
 function saveProgressNow() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book || !chapters.length) return;
-    book.lastReadChapterIdx = currentChapterIdx;
-    book.lastReadChapterTitle = chapters[currentChapterIdx].title;
-    book.lastReadChapterRatio = currentChapterRatio();
-    updateBookInDB(book);
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta || !chapters.length) return;
+    meta.lastReadChapterIdx = currentChapterIdx;
+    meta.lastReadChapterTitle = chapters[currentChapterIdx].title;
+    meta.lastReadChapterRatio = currentChapterRatio();
+    saveMeta(meta);   // 只写轻量 meta，不碰正文
 }
 
 function updateProgressBars() {
@@ -829,14 +939,11 @@ function updateProgressBars() {
     if (chapText) chapText.innerText = (intra * 100).toFixed(1) + '%';
 }
 
-// 跳章：目标不在窗口内就重建窗口
 function goToChapter(idx, ratio = 0) {
     idx = Math.min(Math.max(idx, 0), chapters.length - 1);
     const area = document.getElementById('reader-scroll-area');
 
-    if (idx < loadedStart || idx > loadedEnd) {
-        renderWindow(idx);
-    }
+    if (idx < loadedStart || idx > loadedEnd) renderWindow(idx);
     currentChapterIdx = idx;
 
     requestAnimationFrame(() => {
@@ -856,7 +963,6 @@ function seekFullBook(val) {
     const target = Math.min(chapters.length - 1, Math.floor((val / 1000) * chapters.length));
     const text = document.getElementById('full-progress-text');
     if (text) text.innerText = ((val / 1000) * 100).toFixed(1) + '%';
-    // 拖动时不每帧重建 DOM，松手前的抖动全部合并成一次跳转
     clearTimeout(seekTimer);
     seekTimer = setTimeout(() => goToChapter(target, 0), 90);
 }
@@ -875,25 +981,31 @@ function seekChapter(val) {
 function prevChapter() { if (currentChapterIdx > 0) goToChapter(currentChapterIdx - 1, 0); }
 function nextChapter() { if (currentChapterIdx < chapters.length - 1) goToChapter(currentChapterIdx + 1, 0); }
 
-function jumpToChapter(idx) {
-    goToChapter(idx, 0);
-    closePanels();
-}
+function jumpToChapter(idx) { goToChapter(idx, 0); closePanels(); }
 
-// 目录可能上万条，等第一次打开侧栏再建
+/* 目录分批插入，上万条也不卡住主线程 */
 function renderTOC() {
     if (tocRendered) return;
     const list = document.getElementById('toc-list');
     const total = chapters.length;
-    let html = '';
-    for (let i = 0; i < total; i++) {
-        html += `<div class="chapter-item${i === currentChapterIdx ? ' active' : ''}" data-toc="${i}" onclick="jumpToChapter(${i})">`
-            + `<span>${escapeHTML(chapters[i].title)}</span>`
-            + `<span style="font-size:0.7rem; opacity:0.5;">${Math.round((i + 1) / total * 100)}%</span>`
-            + `</div>`;
-    }
-    list.innerHTML = html;
+    list.innerHTML = '';
     tocRendered = true;
+
+    let i = 0;
+    const CHUNK = 300;
+    function step() {
+        const end = Math.min(total, i + CHUNK);
+        let html = '';
+        for (; i < end; i++) {
+            html += `<div class="chapter-item${i === currentChapterIdx ? ' active' : ''}" data-toc="${i}" onclick="jumpToChapter(${i})">`
+                + `<span>${escapeHTML(chapters[i].title)}</span>`
+                + `<span style="font-size:0.7rem; opacity:0.5;">${Math.round((i + 1) / total * 100)}%</span>`
+                + `</div>`;
+        }
+        list.insertAdjacentHTML('beforeend', html);
+        if (i < total) setTimeout(step, 0);
+    }
+    step();
 }
 
 function closeReader() {
@@ -907,7 +1019,6 @@ function closeReader() {
     document.getElementById('home-view').style.display = 'block';
     document.getElementById('reader-view').style.display = 'none';
 
-    // 放掉正文和 DOM，别让整本书一直挂在内存里
     document.getElementById('reader-content').innerHTML = '';
     document.getElementById('toc-list').innerHTML = '';
     bookContent = '';
@@ -930,10 +1041,7 @@ function toggleMenu() {
     const menu = document.getElementById('bottom-menu'), nav = document.getElementById('reader-nav');
     const open = menu.classList.toggle('open');
     nav.classList.toggle('hidden', !open);
-    if (open) {
-        updateProgressBars();
-        switchReaderMenu(0);
-    }
+    if (open) { updateProgressBars(); switchReaderMenu(0); }
 }
 
 function toggleSidebar() {
@@ -998,20 +1106,20 @@ function switchReaderMenu(idx) {
 
 function openRecordCard(id) {
     currentBookId = id;
-    const book = books.find(b => b.id === id);
-    if (!book) return;
+    const meta = books.find(b => b.id === id);
+    if (!meta) return;
     const bookCard = document.getElementById('book-card-' + id);
     const rect = bookCard ? bookCard.getBoundingClientRect() : null;
 
-    if (!book.recordCards) book.recordCards = [];
+    if (!meta.recordCards) meta.recordCards = [];
 
     let currentChapter = "";
     if (document.getElementById('reader-view').style.display === 'block' && chapters[currentChapterIdx]) {
         currentChapter = chapters[currentChapterIdx].title;
     }
 
-    if (book.recordCards.length === 0) {
-        book.recordCards.push({ title: "阅读记录", time: new Date().toLocaleDateString(), content: "", chapter: currentChapter });
+    if (meta.recordCards.length === 0) {
+        meta.recordCards.push({ title: "阅读记录", time: new Date().toLocaleDateString(), content: "", chapter: currentChapter });
     }
     recordPageIndex = 0;
     updateRecordCardUI();
@@ -1035,36 +1143,36 @@ function openRecordCard(id) {
 }
 
 function updateRecordCardUI() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book) return;
-    const card = book.recordCards[recordPageIndex];
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta) return;
+    const card = meta.recordCards[recordPageIndex];
     document.getElementById('record-title').value = card.title;
     document.getElementById('record-time').innerText = card.time;
     document.getElementById('record-content').value = card.content;
     document.getElementById('record-chapter').value = card.chapter || "";
-    document.getElementById('record-page-info').innerText = `${recordPageIndex + 1} / ${book.recordCards.length}`;
+    document.getElementById('record-page-info').innerText = `${recordPageIndex + 1} / ${meta.recordCards.length}`;
 }
 
 function saveRecordData() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book || !book.recordCards || !book.recordCards[recordPageIndex]) return;
-    book.recordCards[recordPageIndex].title = document.getElementById('record-title').value;
-    book.recordCards[recordPageIndex].content = document.getElementById('record-content').value;
-    book.recordCards[recordPageIndex].chapter = document.getElementById('record-chapter').value;
-    updateBookInDB(book);
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta || !meta.recordCards || !meta.recordCards[recordPageIndex]) return;
+    meta.recordCards[recordPageIndex].title = document.getElementById('record-title').value;
+    meta.recordCards[recordPageIndex].content = document.getElementById('record-content').value;
+    meta.recordCards[recordPageIndex].chapter = document.getElementById('record-chapter').value;
+    saveMeta(meta);
 }
 
 function addRecordPage() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book) return;
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta) return;
     let currentChapter = "";
     if (document.getElementById('reader-view').style.display === 'block' && chapters[currentChapterIdx]) {
         currentChapter = chapters[currentChapterIdx].title;
     }
-    book.recordCards.push({ title: "新记录", time: new Date().toLocaleDateString(), content: "", chapter: currentChapter });
-    recordPageIndex = book.recordCards.length - 1;
+    meta.recordCards.push({ title: "新记录", time: new Date().toLocaleDateString(), content: "", chapter: currentChapter });
+    recordPageIndex = meta.recordCards.length - 1;
     updateRecordCardUI();
-    updateBookInDB(book);
+    saveMeta(meta);
 }
 
 function prevRecordPage() {
@@ -1072,21 +1180,21 @@ function prevRecordPage() {
 }
 
 function nextRecordPage() {
-    const book = books.find(b => b.id === currentBookId);
-    if (book && recordPageIndex < book.recordCards.length - 1) { recordPageIndex++; updateRecordCardUI(); }
+    const meta = books.find(b => b.id === currentBookId);
+    if (meta && recordPageIndex < meta.recordCards.length - 1) { recordPageIndex++; updateRecordCardUI(); }
 }
 
 function deleteRecordPage() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book || !book.recordCards || book.recordCards.length === 0) return;
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta || !meta.recordCards || meta.recordCards.length === 0) return;
     if (confirm('确定要删除这一页记录吗？此操作不可撤销。')) {
-        book.recordCards.splice(recordPageIndex, 1);
-        if (book.recordCards.length === 0) {
-            book.recordCards.push({ title: "阅读记录", time: new Date().toLocaleDateString(), content: "", chapter: "" });
+        meta.recordCards.splice(recordPageIndex, 1);
+        if (meta.recordCards.length === 0) {
+            meta.recordCards.push({ title: "阅读记录", time: new Date().toLocaleDateString(), content: "", chapter: "" });
         }
-        if (recordPageIndex >= book.recordCards.length) recordPageIndex = book.recordCards.length - 1;
+        if (recordPageIndex >= meta.recordCards.length) recordPageIndex = meta.recordCards.length - 1;
         updateRecordCardUI();
-        updateBookInDB(book);
+        saveMeta(meta);
     }
 }
 
@@ -1098,19 +1206,19 @@ function closeRecordCard() {
 }
 
 function openNotesEditCard() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book) return;
-    document.getElementById('notes-edit-content').value = book.notes || '';
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta) return;
+    document.getElementById('notes-edit-content').value = meta.notes || '';
     document.getElementById('notes-edit-overlay').style.display = 'flex';
     setTimeout(() => document.getElementById('notes-edit-card').classList.add('active'), 10);
 }
 
 function saveNotesEditCard() {
-    const book = books.find(b => b.id === currentBookId);
-    if (!book) return;
-    book.notes = document.getElementById('notes-edit-content').value;
-    updateBookInDB(book);
-    document.getElementById('reader-notes-display').innerText = book.notes || '无备注';
+    const meta = books.find(b => b.id === currentBookId);
+    if (!meta) return;
+    meta.notes = document.getElementById('notes-edit-content').value;
+    saveMeta(meta);
+    document.getElementById('reader-notes-display').innerText = meta.notes || '无备注';
     closeNotesEditCard();
 }
 
@@ -1181,10 +1289,10 @@ function setReaderBG(bg, text) {
     const rv = document.getElementById('reader-view');
     rv.style.backgroundImage = 'none';
     rv.style.backgroundColor = bg;
-    document.getElementById('reader-content').style.color = text;
+    const rc = document.getElementById('reader-content');
+    rc.style.color = text;
     document.getElementById('reader-nav').style.color = text;
-    // 章节标题颜色交给 CSS 变量，新增章节也能跟上
-    document.getElementById('reader-content').style.setProperty('--accent-color', text);
+    rc.style.setProperty('--accent-color', text);
 }
 
 function applyBGURL() {
@@ -1205,7 +1313,6 @@ function applyBGFile(e) {
 
 /* ═══════════ 书籍 / 分类 ═══════════ */
 
-function updateBookInDB(book) { db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).put(book); }
 function saveCats() { localStorage.setItem('yy_cats_v22', JSON.stringify(categories)); }
 function closeModal(id) { document.getElementById(id).style.display = 'none'; tempCoverData = ""; }
 
@@ -1222,7 +1329,7 @@ function addCategory() {
 
 function deleteCategory(i) {
     const d = categories.splice(i, 1)[0];
-    books.forEach(b => { if (b.category === d) { b.category = categories[0] || '其他'; updateBookInDB(b); } });
+    books.forEach(b => { if (b.category === d) { b.category = categories[0] || '其他'; saveMeta(b); } });
     saveCats(); openCatModal(); renderCategoryBar(); renderBookshelf();
 }
 
@@ -1230,7 +1337,7 @@ function openEditModal(id) {
     currentBookId = id;
     const b = books.find(x => x.id === id);
     if (!b) return;
-    document.getElementById('edit-category').innerHTML = categories.map(c => `<option value="${c}" ${c === b.category ? 'selected' : ''}>${c}</option>`).join('');
+    document.getElementById('edit-category').innerHTML = categories.map(c => `<option value="${escapeHTML(c)}" ${c === b.category ? 'selected' : ''}>${escapeHTML(c)}</option>`).join('');
     document.getElementById('edit-name').value = b.name;
     document.getElementById('edit-author').value = b.author || '';
     document.getElementById('edit-show-title').checked = b.showTitleOnCover !== false;
@@ -1272,13 +1379,23 @@ function openEditModalFromReader() { openEditModal(currentBookId); }
 function saveBookDetails() {
     const b = books.find(x => x.id === currentBookId);
     if (!b) return;
-    b.name = document.getElementById('edit-name').value;
+    const newName = document.getElementById('edit-name').value;
+    b.name = newName;
     b.author = document.getElementById('edit-author').value;
     b.cover = tempCoverData;
     b.category = document.getElementById('edit-category').value;
     b.showTitleOnCover = document.getElementById('edit-show-title').checked;
     b.notes = document.getElementById('edit-notes').value;
-    updateBookInDB(b);
+    saveMeta(b);
+
+    // books 存储里的 name 同步一份，导出备份时用得到
+    getBookRecord(b.id).then(rec => {
+        if (rec && rec.name !== newName) {
+            rec.name = newName;
+            txStore(STORE_NAME, 'readwrite').put(rec);
+        }
+    }).catch(() => {});
+
     renderBookshelf();
     if (document.getElementById('reader-view').style.display === 'block') {
         document.getElementById('reader-book-title').innerText = b.name;
@@ -1293,7 +1410,9 @@ function saveBookDetails() {
 
 function deleteBook() {
     if (confirm('确定移除此书吗？')) {
-        db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME).delete(currentBookId);
+        const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
+        tx.objectStore(STORE_NAME).delete(currentBookId);
+        tx.objectStore(META_STORE).delete(currentBookId);
         books = books.filter(x => x.id !== currentBookId);
         renderBookshelf();
         closeModal('edit-modal');
@@ -1311,8 +1430,7 @@ function handleSelection(e) {
     } else m.style.display = 'none';
 }
 
-/* 标注只做视觉效果，不再回写 book.content。
-   窗口化渲染下 DOM 里只有几章，用 innerText 覆盖会把整本书截断。 */
+/* 标注只做视觉效果，不回写正文 */
 function annotate(c) {
     const s = window.getSelection();
     if (!s.rangeCount) return;
@@ -1335,7 +1453,7 @@ function handleDiscoverDrop(e) {
     importFiles({ target: { files: Array.from(e.dataTransfer.files), value: '' } });
 }
 
-// ── 发现页：搜索笔记 ──
+// ── 发现页：搜索笔记（只查 meta，不触碰正文）──
 function searchNotes(query) {
     const resultsDiv = document.getElementById('note-search-results');
     if (!query.trim()) { resultsDiv.innerHTML = ''; return; }
@@ -1378,43 +1496,57 @@ function searchNotes(query) {
     }).join('');
 }
 
-// ── 关于页：导出备份 ──
+/* ── 关于页：导出备份（游标逐本拼装，避免一次性全量入内存）── */
 async function exportBackup() {
     const toastEl = document.getElementById('backup-toast');
     toastEl.style.display = 'block';
     toastEl.textContent = '正在打包备份…';
     try {
-        const allBooks = await new Promise((res, rej) => {
+        const metaById = new Map(books.map(m => [m.id, m]));
+        const parts = ['\uFEFF{"version":"2.5","exportTime":"' + new Date().toISOString() + '","categories":'
+            + JSON.stringify(categories) + ',"books":['];
+
+        await new Promise((resolve, reject) => {
             const tx = db.transaction([STORE_NAME], 'readonly');
-            const req = tx.objectStore(STORE_NAME).getAll();
-            req.onsuccess = () => res(req.result);
-            req.onerror = rej;
+            const cursorReq = tx.objectStore(STORE_NAME).openCursor();
+            let first = true;
+            cursorReq.onsuccess = (ev) => {
+                const cur = ev.target.result;
+                if (!cur) return;
+                const rec = cur.value;
+                const meta = metaById.get(rec.id) || {};
+                const out = Object.assign({}, meta, {
+                    id: rec.id,
+                    name: meta.name || rec.name,
+                    content: rec.content || '',
+                    encoding: rec.encoding || meta.encoding || ''
+                });
+                delete out.hasRaw;
+                delete out.charCount;
+                delete out.garbled;
+                parts.push((first ? '' : ',') + JSON.stringify(out));
+                first = false;
+                cur.continue();
+            };
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
         });
-        const plainBooks = allBooks.map(b => {
-            const copy = Object.assign({}, b);
-            delete copy.rawFile;   // File 对象没法 JSON 序列化
-            return copy;
-        });
-        const backup = {
-            version: '2.4',
-            exportTime: new Date().toISOString(),
-            categories: JSON.parse(localStorage.getItem('yy_cats_v22') || '[]'),
-            books: plainBooks
-        };
-        const blob = new Blob(['\uFEFF' + JSON.stringify(backup)], { type: 'application/json;charset=utf-8' });
+
+        parts.push(']}');
+        const blob = new Blob(parts, { type: 'application/json;charset=utf-8' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = '藏书馆备份_' + new Date().toLocaleDateString('zh-CN').replace(/\//g, '-') + '.cangshuguan';
         a.click();
-        URL.revokeObjectURL(a.href);
+        setTimeout(() => URL.revokeObjectURL(a.href), 3000);
         toastEl.textContent = '✓ 备份已导出';
     } catch (e) {
-        toastEl.textContent = '导出失败：' + e.message;
+        toastEl.textContent = '导出失败：' + (e && e.message ? e.message : '未知错误');
     }
     setTimeout(() => { toastEl.style.display = 'none'; }, 2500);
 }
 
-// ── 关于页：导入备份 ──
+/* ── 关于页：导入备份 ── */
 async function importBackup(event) {
     const toastEl = document.getElementById('backup-toast');
     const file = event.target.files[0];
@@ -1428,27 +1560,35 @@ async function importBackup(event) {
 
         if (backup.categories && Array.isArray(backup.categories)) {
             backup.categories.forEach(c => { if (!categories.includes(c)) categories.push(c); });
-            localStorage.setItem('yy_cats_v22', JSON.stringify(categories));
+            saveCats();
         }
 
         const existingIds = new Set(books.map(b => b.id));
         let added = 0;
-        const tx = db.transaction([STORE_NAME], 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        for (const book of backup.books) {
-            if (!existingIds.has(book.id)) {
-                store.add(book);
-                books.push(book);
-                added++;
-            }
+        const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
+        const bookStore = tx.objectStore(STORE_NAME);
+        const metaStore = tx.objectStore(META_STORE);
+        for (const item of backup.books) {
+            if (existingIds.has(item.id)) continue;
+            bookStore.put({
+                id: item.id,
+                name: item.name || '未命名',
+                content: item.content || '',
+                encoding: item.encoding || ''
+            });
+            const meta = buildMeta(item);
+            meta.hasRaw = false;   // 备份不含原始字节
+            metaStore.put(meta);
+            books.push(meta);
+            added++;
         }
-        await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+        await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
 
         renderCategoryBar();
         renderBookshelf();
         toastEl.textContent = `✓ 已导入 ${added} 本书籍`;
     } catch (e) {
-        toastEl.textContent = '导入失败：' + e.message;
+        toastEl.textContent = '导入失败：' + (e && e.message ? e.message : '未知错误');
     }
     event.target.value = '';
     setTimeout(() => { toastEl.style.display = 'none'; }, 3000);
