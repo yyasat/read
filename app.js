@@ -25,6 +25,7 @@ let searchReturnTimeout = null;
 let recordTouchY = 0;
 let recordTouchTime = 0;
 let recordPageIndex = 0;
+let importing = false;   // 防止导入任务并发
 
 /* ═══════════ 阅读器状态 ═══════════ */
 let bookContent = "";
@@ -199,7 +200,7 @@ function renderBookshelf() {
     shelf.innerHTML = '';
     const filtered = currentFilter === '全部' ? books : books.filter(b => b.category === currentFilter);
     if (filtered.length === 0) {
-        shelf.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; padding: 100px 20px; opacity: 0.3; font-size: 0.9rem;">书架空空如也</div>`;
+        shelf.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; padding: 100px 20px; opacity: 0.3; font-size: 0.9rem; line-height: 2;">书架空空如也<br><span style="font-size:0.75rem;">去「发现」页导入书籍</span></div>`;
         return;
     }
     const frag = document.createDocumentFragment();
@@ -414,11 +415,17 @@ function readFileAsBuffer(file) {
     });
 }
 
-function readBlobAsText(blob, encoding) {
+/* onProgress 收 0~1 的字节读取比例，用于驱动导入进度条 */
+function readBlobAsText(blob, encoding, onProgress) {
     return new Promise((resolve) => {
         const reader = new FileReader();
         reader.onload = (e) => resolve(e.target.result);
         reader.onerror = () => resolve(null);
+        if (onProgress) {
+            reader.onprogress = (e) => {
+                if (e.lengthComputable && e.total) onProgress(e.loaded / e.total);
+            };
+        }
         try {
             reader.readAsText(blob, encoding);
         } catch (err) {
@@ -441,33 +448,40 @@ function inspectBytes(buffer) {
     }
 }
 
-/* 候选编码只在前 256KB 上试解码，大文件不用整本跑一遍 */
-async function detectAndDecode(blob) {
+/* 候选编码只在前 256KB 上试解码，大文件不用整本跑一遍
+   onProgress：0~0.28 为编码探测阶段，0.3~1 为整本解码阶段 */
+async function detectAndDecode(blob, onProgress) {
+    const report = (p) => { if (onProgress) onProgress(Math.max(0, Math.min(1, p))); };
     const probe = blob.size > 262144 ? blob.slice(0, 262144) : blob;
     const buffer = await readFileAsBuffer(probe);
     const info = inspectBytes(buffer);
+    report(0.08);
+
+    const decodeFull = (enc) => readBlobAsText(blob, enc, (p) => report(0.3 + 0.7 * p));
 
     if (info.bom) {
-        const text = await readBlobAsText(blob, info.bom);
-        if (text !== null) return { text: text.replace(/^\uFEFF/, ''), encoding: info.bom };
+        const text = await decodeFull(info.bom);
+        if (text !== null) { report(1); return { text: text.replace(/^\uFEFF/, ''), encoding: info.bom }; }
     }
 
     if (info.strictUtf8) {
-        const text = await readBlobAsText(blob, 'utf-8');
-        if (text !== null) return { text: text.replace(/^\uFEFF/, ''), encoding: 'utf-8' };
+        const text = await decodeFull('utf-8');
+        if (text !== null) { report(1); return { text: text.replace(/^\uFEFF/, ''), encoding: 'utf-8' }; }
     }
 
     const candidates = ['gb18030', 'gbk', 'big5', 'utf-8'];
     const results = [];
-    for (const enc of candidates) {
-        const t = await readBlobAsText(probe, enc);
+    for (let ci = 0; ci < candidates.length; ci++) {
+        const t = await readBlobAsText(probe, candidates[ci]);
+        report(0.08 + 0.2 * ((ci + 1) / candidates.length));
         if (t === null || t === '') continue;
         const s = scoreDecoded(t);
-        results.push({ encoding: enc, bad: s.bad, cjk: s.cjk });
+        results.push({ encoding: candidates[ci], bad: s.bad, cjk: s.cjk });
     }
 
     if (results.length === 0) {
-        const fallback = await readBlobAsText(blob, 'utf-8');
+        const fallback = await decodeFull('utf-8');
+        report(1);
         return { text: fallback || '', encoding: 'utf-8' };
     }
 
@@ -477,7 +491,8 @@ async function detectAndDecode(blob) {
         if (c.bad < best.bad) best = c;
         else if (c.bad === best.bad && c.cjk > best.cjk) best = c;
     }
-    const full = await readBlobAsText(blob, best.encoding);
+    const full = await decodeFull(best.encoding);
+    report(1);
     return { text: (full || '').replace(/^\uFEFF/, ''), encoding: best.encoding };
 }
 
@@ -575,14 +590,76 @@ function syncEncodingUI(meta) {
     }
 }
 
+/* ═══════════════════════════════════════════
+   导入进度条
+   进度构成：已完成本数 + 当前文件内部读取比例，合成为总进度
+   ═══════════════════════════════════════════ */
+
+const nextFrame = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+
+function showImportProgress(total) {
+    const ov = document.getElementById('import-progress-overlay');
+    if (!ov) return;
+    document.getElementById('ip-bar-fill').style.width = '0%';
+    document.getElementById('ip-percent').innerText = '0%';
+    document.getElementById('ip-count').innerText = `0 / ${total} 本`;
+    document.getElementById('ip-file').innerText = '准备中…';
+    document.getElementById('ip-stage').innerText = '准备中';
+    ov.style.display = 'flex';
+    requestAnimationFrame(() => {
+        ov.style.opacity = '1';
+        const card = document.getElementById('import-progress-card');
+        if (card) card.style.transform = 'scale(1)';
+    });
+}
+
+function updateImportProgress(o) {
+    const fill = document.getElementById('ip-bar-fill');
+    if (!fill) return;
+    const pct = Math.max(0, Math.min(1, o.ratio || 0)) * 100;
+    fill.style.width = pct.toFixed(1) + '%';
+    document.getElementById('ip-percent').innerText = Math.round(pct) + '%';
+    const bar = document.getElementById('ip-bar');
+    if (bar) bar.setAttribute('aria-valuenow', String(Math.round(pct)));
+    if (o.file) document.getElementById('ip-file').innerText = o.file;
+    if (o.stage) document.getElementById('ip-stage').innerText = o.stage;
+    if (typeof o.done === 'number') document.getElementById('ip-count').innerText = `${o.done} / ${o.total} 本`;
+}
+
+function hideImportProgress(delay) {
+    const ov = document.getElementById('import-progress-overlay');
+    if (!ov) return;
+    setTimeout(() => {
+        ov.style.opacity = '0';
+        const card = document.getElementById('import-progress-card');
+        if (card) card.style.transform = 'scale(0.94)';
+        setTimeout(() => { ov.style.display = 'none'; }, 280);
+    }, delay || 0);
+}
+
 async function importFiles(event) {
-    const files = Array.from(event.target.files);
+    const files = Array.from((event.target && event.target.files) || []);
     if (!files.length) return;
+    if (importing) { toast('已有导入任务正在进行'); return; }
+    if (!db) { toast('数据库尚未就绪，请稍候重试'); return; }
+    importing = true;
+
+    const total = files.length;
+    showImportProgress(total);
+    await nextFrame();   // 让弹窗先画出来，再进重活
 
     const report = [];
-    for (const file of files) {
+    for (let i = 0; i < total; i++) {
+        const file = files[i];
+        updateImportProgress({ ratio: i / total, file: file.name, stage: '读取解码', done: i, total });
+        await nextFrame();
         try {
-            const { text, encoding } = await detectAndDecode(file);
+            const { text, encoding } = await detectAndDecode(file, (p) => {
+                updateImportProgress({ ratio: (i + p * 0.85) / total });
+            });
+
+            updateImportProgress({ ratio: (i + 0.9) / total, stage: '写入书架' });
+
             const id = Date.now() + Math.random();
             const record = {
                 id,
@@ -608,23 +685,43 @@ async function importFiles(event) {
                 charCount: text.length,
                 garbled: isGarbled(text)
             };
+
             const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
             tx.objectStore(STORE_NAME).add(record);
             tx.objectStore(META_STORE).add(meta);
+            await new Promise((res, rej) => {
+                tx.oncomplete = res;
+                tx.onerror = () => rej(tx.error || new Error('写入失败'));
+                tx.onabort = () => rej(tx.error || new Error('写入被中断'));
+            });
+
             books.push(meta);
             report.push({ name: meta.name, encoding, garbled: meta.garbled });
         } catch (err) {
             report.push({ name: file.name, encoding: '读取失败', garbled: true });
         }
+        updateImportProgress({ ratio: (i + 1) / total, stage: '已完成', done: i + 1, total });
+        await nextFrame();
     }
-    renderBookshelf();
-    if (event.target && 'value' in event.target) event.target.value = '';
 
-    if (report.length) {
-        const bad = report.filter(r => r.garbled);
-        if (bad.length) toast(`导入 ${report.length} 本，${bad.length} 本仍有乱码，双击该书手动选编码`);
-        else toast(`✓ 已导入 ${report.length} 本 · 编码 ${report[0].encoding}`);
+    renderBookshelf();
+    if (event.target && 'value' in event.target) {
+        try { event.target.value = ''; } catch (e) {}
     }
+    importing = false;
+
+    const bad = report.filter(r => r.garbled);
+    updateImportProgress({
+        ratio: 1,
+        stage: '完成',
+        done: total,
+        total,
+        file: bad.length ? `${bad.length} 本需手动选编码` : '全部导入完成'
+    });
+    hideImportProgress(700);
+
+    if (bad.length) toast(`导入 ${report.length} 本，${bad.length} 本仍有乱码，双击该书手动选编码`);
+    else toast(`✓ 已导入 ${report.length} 本 · 编码 ${report[0].encoding}`);
 }
 
 function escapeHTML(str) {
