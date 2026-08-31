@@ -1,27 +1,29 @@
 /* ═══════════════════════════════════════════════════════════
-   epub.js — EPUB 解析（ZIP + inflate + XHTML→受控 HTML + 图片/CSS + 章节）
+   epub.js — EPUB 解析（ZIP + inflate + XHTML→受控 HTML + 图片/字体/CSS + 章节）
    对外只暴露 window.EpubKit = { isEpub, parse }
    parse(file, onProgress) -> {
-     html,          // 受控 HTML 全文（图片写成 <img data-eimg="e1">）
-     textLength,    // 近似正文字数（不含标签），用于书架显示
-     chapters,      // [{title, from, to}]，from/to 均落在顶层块边界，可安全切片
-     images,        // { e1: {u: dataURL, w, h}, ... }
-     css,           // 已作用域化 + 净化的书内样式
-     title, author, cover, isHTML: true
+     html, isHTML, textLength, chapters, images, css, title, author, cover
    }
+   图片写成 <img data-eimg="e1">，images[key] = {u:dataURL, w, h}
+   css 已作用域化到 #reader-content .epub-body，并内联 @font-face
    ═══════════════════════════════════════════════════════════ */
 (function (global) {
     'use strict';
 
-    /* ── 工具 ── */
+    /* ── 常量 ── */
+
+    const SCOPE = '#reader-content .epub-body';
+    const PAGE_W = 600;                    // EPUB 排版假定页宽，px→% 换算基准
+    const BASE_FS = 16;                    // px→em 换算基准
+    const MAX_BLOCK = 24000;
+    const IMG_MAX_W = 1400;
+    const IMG_BUDGET = 14 * 1024 * 1024;
+    const FONT_BUDGET = 8 * 1024 * 1024;
+    const CSS_BUDGET = 500000;
 
     const nextTick = () => new Promise(r => setTimeout(r, 0));
 
-    const SCOPE = '#reader-content .epub-body';
-    const MAX_BLOCK = 24000;          // 单个渲染块最大 HTML 字符数
-    const IMG_MAX_W = 1200;           // 内文图片最大宽度
-    const IMG_BUDGET = 14 * 1024 * 1024;   // 全书图片 data URL 总预算
-    const CSS_BUDGET = 400000;
+    let currentFonts = null;               // 本次解析成功嵌入的字体家族（小写）
 
     function readFileBuffer(file) {
         if (file.arrayBuffer) return file.arrayBuffer();
@@ -217,7 +219,6 @@
         return dst.subarray(0, dlen);
     }
 
-    /* 原生解压优先，用 3 字节探针确认 deflate-raw 真的可用 */
     let nativeInflate = null;
     async function detectNative() {
         if (nativeInflate !== null) return nativeInflate;
@@ -376,68 +377,191 @@
     function firstLocal(root, name) { const l = localTags(root, name); return l.length ? l[0] : null; }
     function textOfEl(el) { return el ? String(el.textContent || '').replace(/\s+/g, ' ').trim() : ''; }
 
-    /* ══════════ CSS：净化 + 作用域化 ══════════ */
+    /* ══════════ 颜色 ══════════ */
 
     const NAMED_COLORS = {
-        black: [0,0,0], white: [255,255,255], silver: [192,192,192], gray: [128,128,128],
-        grey: [128,128,128], red: [255,0,0], maroon: [128,0,0], yellow: [255,255,0],
-        olive: [128,128,0], lime: [0,255,0], green: [0,128,0], aqua: [0,255,255],
-        cyan: [0,255,255], teal: [0,128,128], blue: [0,0,255], navy: [0,0,128],
-        fuchsia: [255,0,255], magenta: [255,0,255], purple: [128,0,128],
-        orange: [255,165,0], brown: [165,42,42], pink: [255,192,203]
+        black:[0,0,0,1], white:[255,255,255,1], silver:[192,192,192,1], gray:[128,128,128,1],
+        grey:[128,128,128,1], red:[255,0,0,1], maroon:[128,0,0,1], yellow:[255,255,0,1],
+        olive:[128,128,0,1], lime:[0,255,0,1], green:[0,128,0,1], aqua:[0,255,255,1],
+        cyan:[0,255,255,1], teal:[0,128,128,1], blue:[0,0,255,1], navy:[0,0,128,1],
+        fuchsia:[255,0,255,1], magenta:[255,0,255,1], purple:[128,0,128,1],
+        orange:[255,165,0,1], brown:[165,42,42,1], pink:[255,192,203,1],
+        transparent:[0,0,0,0]
     };
 
     function parseColor(v) {
-        v = String(v).trim().toLowerCase();
-        if (NAMED_COLORS[v]) return NAMED_COLORS[v];
+        v = String(v || '').trim().toLowerCase();
+        if (NAMED_COLORS[v]) return NAMED_COLORS[v].slice();
         let m = v.match(/^#([0-9a-f]{3})$/);
-        if (m) return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16)];
+        if (m) return [parseInt(m[1][0]+m[1][0],16), parseInt(m[1][1]+m[1][1],16), parseInt(m[1][2]+m[1][2],16), 1];
         m = v.match(/^#([0-9a-f]{6})$/);
-        if (m) return [parseInt(m[1].slice(0,2),16), parseInt(m[1].slice(2,4),16), parseInt(m[1].slice(4,6),16)];
-        m = v.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/);
-        if (m) return [+m[1], +m[2], +m[3]];
+        if (m) return [parseInt(m[1].slice(0,2),16), parseInt(m[1].slice(2,4),16), parseInt(m[1].slice(4,6),16), 1];
+        m = v.match(/^#([0-9a-f]{8})$/);
+        if (m) return [parseInt(m[1].slice(0,2),16), parseInt(m[1].slice(2,4),16), parseInt(m[1].slice(4,6),16), parseInt(m[1].slice(6,8),16)/255];
+        m = v.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+))?/);
+        if (m) return [+m[1], +m[2], +m[3], m[4] === undefined ? 1 : +m[4]];
         return null;
     }
 
-    function luminance(c) { return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255; }
+    function luminance(c) { return (0.299*c[0] + 0.587*c[1] + 0.114*c[2]) / 255; }
 
-    /* 近黑/近白的前景色交给主题决定，否则夜间模式下会出现黑字压黑底 */
-    function normalizeColor(prop, value) {
-        const c = parseColor(value);
-        if (!c) return /url\s*\(/i.test(value) ? null : value;
-        const L = luminance(c);
-        if (prop === 'color') return (L < 0.22 || L > 0.86) ? 'inherit' : value;
-        return (L < 0.12 || L > 0.9) ? 'transparent' : value;   // 背景同理
+    /* ══════════ CSS 净化 ══════════ */
+
+    /* 直接丢弃：会脱离文档流、依赖包内资源、或与阅读器自身机制冲突 */
+    const DROP_PROPS = /^(font|src|writing-mode|-epub-writing-mode|direction|unicode-bidi|list-style-image|background-image|background-attachment|background-blend-mode|page-break-.*|break-.*|column.*|-webkit-column.*|transform.*|animation.*|transition.*|will-change|filter|backdrop-filter|mix-blend-mode|content-visibility|contain|cursor|pointer-events|user-select|-webkit-user-select|-webkit-text-size-adjust|zoom)$/i;
+
+    /* px→em：字号与间距类，跟随用户字号缩放 */
+    const EM_PROPS = /^(font-size|line-height|text-indent|letter-spacing|word-spacing|margin|margin-.*|padding|padding-.*|top|right|bottom|left|border-radius|border-.*-radius|border-width|border-.*-width|gap|row-gap|column-gap|text-underline-offset|outline-offset|outline-width)$/i;
+
+    /* px→%：宽度类，按 600px 页宽折算 */
+    const PCT_PROPS = /^(width|min-width|max-width|flex-basis)$/i;
+
+    /* 高度只接受相对单位，px 高度会在窄屏上裁掉内容 */
+    const HEIGHT_PROPS = /^(height|min-height|max-height)$/i;
+
+    function splitDecls(t) {
+        const out = [];
+        let depth = 0, cur = '';
+        for (let i = 0; i < t.length; i++) {
+            const c = t.charAt(i);
+            if (c === '(') depth++;
+            else if (c === ')') depth--;
+            if (c === ';' && depth === 0) { out.push(cur); cur = ''; }
+            else cur += c;
+        }
+        if (cur.trim()) out.push(cur);
+        return out;
     }
 
-    const DROP_PROPS = /^(font-family|font|src|position|top|left|right|bottom|z-index|float|clear|width|min-width|max-width|height|min-height|max-height|overflow|overflow-x|overflow-y|page-break-before|page-break-after|page-break-inside|-webkit-column-.*|column-.*|writing-mode|-epub-writing-mode|direction)$/i;
+    function trimNum(n) {
+        let s = n.toFixed(3);
+        if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+        return s;
+    }
 
-    function sanitizeDecls(declText, isInline) {
-        const out = [];
-        String(declText || '').split(';').forEach(one => {
+    function pxToEm(v) {
+        return v.replace(/(-?[\d.]+)px/gi, (m, n) => trimNum(parseFloat(n) / BASE_FS) + 'em');
+    }
+    function pxToPct(v) {
+        return v.replace(/(-?[\d.]+)px/gi, (m, n) => {
+            const pct = parseFloat(n) / PAGE_W * 100;
+            return trimNum(Math.max(0, Math.min(100, pct))) + '%';
+        });
+    }
+    const hasRelUnit = v => /(em|rem|%|vh|vw|ex|ch)\s*$/i.test(v) || /^(auto|inherit|initial|unset|fit-content|min-content|max-content)$/i.test(v);
+
+    function keepFontFamily(val) {
+        if (!currentFonts || !currentFonts.size) return null;
+        const names = String(val).split(',').map(s => s.trim().replace(/^["']|["']$/g, '').toLowerCase());
+        for (let i = 0; i < names.length; i++) {
+            if (currentFonts.has(names[i])) return val;
+        }
+        return null;   // 字体没嵌进来就别指定，免得掉到 Times New Roman
+    }
+
+    /* 前景/背景成对判断：
+       - 同一规则里前景 + 背景都在 → 原样保留，对比关系是作者定的
+       - 只有前景且是极端色 → 一个主题留原值，另一个主题发覆盖规则
+       - 只有不透明背景 → 按背景亮度补一个前景色 */
+    function processDecls(text, isInline) {
+        const pairs = [];
+        splitDecls(text).forEach(one => {
             const idx = one.indexOf(':');
             if (idx <= 0) return;
-            let prop = one.slice(0, idx).trim().toLowerCase();
-            let val = one.slice(idx + 1).trim();
-            if (!prop || !val) return;
-            if (/[{}]/.test(prop) || /[{}]/.test(val)) return;
-            if (/expression\s*\(|javascript:/i.test(val)) return;
-            if (DROP_PROPS.test(prop)) return;
-            if (/url\s*\(/i.test(val)) return;               // 包内资源已被抽走，url() 一律失效
-            if (prop === 'font-size' || prop === 'line-height') {
-                if (!/(em|rem|%)\s*$/i.test(val)) return;     // 只保留相对单位，绝对值会打乱正文字号
-            }
-            if (prop === 'color' || /^background(-color)?$/.test(prop) || prop === 'border-color') {
-                const nv = normalizeColor(prop === 'color' ? 'color' : 'bg', val);
-                if (nv === null) return;
-                val = nv;
-            }
-            val = val.replace(/!\s*important/gi, '').trim();
-            if (!val) return;
-            out.push(prop + ':' + val);
+            const prop = one.slice(0, idx).trim().toLowerCase();
+            const val = one.slice(idx + 1).replace(/!\s*important/gi, '').trim();
+            if (prop && val && !/[{}]/.test(prop) && !/[{}]/.test(val)) pairs.push([prop, val]);
         });
-        return out.join(';');
+
+        let bgLum = -1;
+        pairs.forEach(([prop, val]) => {
+            if (prop !== 'background' && prop !== 'background-color') return;
+            const raw = val.replace(/url$[^)]*$/gi, '').trim();
+            if (!raw || /^(none|transparent)$/i.test(raw)) return;
+            const c = parseColor(raw.split(/\s+/)[0]) || parseColor(raw);
+            if (c && c[3] >= 0.6) bgLum = luminance(c);
+        });
+        const hasBG = bgLum >= 0;
+
+        const main = [], dark = [], light = [];
+        let sawColor = false;
+
+        for (let i = 0; i < pairs.length; i++) {
+            let prop = pairs[i][0], val = pairs[i][1];
+
+            if (DROP_PROPS.test(prop)) continue;
+            if (/expression\s*\(|javascript:/i.test(val)) continue;
+            if (/url\s*\(/i.test(val) && prop !== 'content') continue;
+
+            if (prop === 'font-family') {
+                const kept = keepFontFamily(val);
+                if (!kept) continue;
+                main.push(prop + ':' + kept);
+                continue;
+            }
+
+            if (prop === 'position') {
+                if (!/^(relative|static)$/i.test(val)) continue;   // absolute/fixed 会脱流盖住正文
+                main.push(prop + ':' + val);
+                continue;
+            }
+
+            if (prop === 'color') {
+                sawColor = true;
+                const c = parseColor(val);
+                if (!c || c[3] < 0.5 || hasBG) { main.push(prop + ':' + val); continue; }
+                const L = luminance(c);
+                if (L < 0.28) {
+                    main.push(prop + ':' + val);                       // 浅色主题下正常
+                    if (!isInline) dark.push('color:var(--text-color)');
+                } else if (L > 0.82) {
+                    main.push(prop + ':' + val);                       // 深色主题下正常
+                    if (!isInline) light.push('color:var(--text-color)');
+                } else {
+                    main.push(prop + ':' + val);                       // 中间色调两边都能看
+                }
+                continue;
+            }
+
+            if (HEIGHT_PROPS.test(prop)) {
+                if (!hasRelUnit(val)) continue;
+                main.push(prop + ':' + val);
+                continue;
+            }
+            if (PCT_PROPS.test(prop)) {
+                main.push(prop + ':' + pxToPct(val));
+                continue;
+            }
+            if (EM_PROPS.test(prop)) {
+                main.push(prop + ':' + pxToEm(val));
+                continue;
+            }
+            if (/^border/.test(prop) || prop === 'outline') {
+                main.push(prop + ':' + pxToEm(val));
+                continue;
+            }
+            if (prop === 'z-index') {
+                if (!/^-?\d{1,3}$/.test(val)) continue;
+                main.push(prop + ':' + val);
+                continue;
+            }
+
+            main.push(prop + ':' + val);
+        }
+
+        // 背景有色但没写前景色：补一个对比色，否则换主题时字会埋进背景
+        if (hasBG && !sawColor) {
+            main.push('color:' + (bgLum > 0.55 ? '#1a1a1a' : '#f2f2f2'));
+        }
+
+        return {
+            main: main.join(';'),
+            dark: dark.join(';'),
+            light: light.join(';')
+        };
     }
+
+    function sanitizeInline(text) { return processDecls(text, true).main; }
 
     function scopeSelector(sel) {
         const out = [];
@@ -449,6 +573,10 @@
             out.push(s ? SCOPE + ' ' + s : SCOPE);
         });
         return out.join(',');
+    }
+
+    function themeScope(scoped, theme) {
+        return scoped.split(',').map(s => 'html[data-theme="' + theme + '"] ' + s.trim()).join(',');
     }
 
     function scopeCSS(src) {
@@ -481,7 +609,7 @@
                         const inner = scopeCSS(src.slice(j + 1, end));
                         if (inner.trim()) out += prelude + '{' + inner + '}';
                     }
-                    // @font-face / @page / @keyframes 丢弃：字体文件已随包内资源失效
+                    // @font-face 已在第一遍单独收集并内联，这里跳过
                     i = end + 1;
                 } else i = j + 1;
                 continue;
@@ -492,13 +620,107 @@
             if (j >= n) break;
             const sel = src.slice(i, j);
             const end = blockEnd(j);
-            const decls = sanitizeDecls(src.slice(j + 1, end), false);
+            const r = processDecls(src.slice(j + 1, end), false);
             i = end + 1;
-            if (!decls) continue;
+            if (!r.main && !r.dark && !r.light) continue;
             const scoped = scopeSelector(sel);
-            if (scoped) out += scoped + '{' + decls + '}';
+            if (!scoped) continue;
+            if (r.main) out += scoped + '{' + r.main + '}';
+            if (r.dark) out += themeScope(scoped, 'dark') + '{' + r.dark + '}';
+            if (r.light) out += themeScope(scoped, 'light') + '{' + r.light + '}';
         }
         return out;
+    }
+
+    /* ══════════ 内嵌字体 ══════════ */
+
+    const FONT_MIME = { woff2:'font/woff2', woff:'font/woff', ttf:'font/ttf', otf:'font/otf', ttc:'font/collection' };
+    const FONT_FMT  = { woff2:'woff2', woff:'woff', ttf:'truetype', otf:'opentype', ttc:'collection' };
+
+    function collectFontFaces(cssText, cssPath) {
+        const faces = [];
+        const re = /@font-face\s*\{([^}]*)\}/gi;
+        let m;
+        while ((m = re.exec(cssText)) !== null) {
+            const body = m[1];
+            let family = '', weight = '', style = '', stretch = '';
+            const srcs = [];
+            splitDecls(body).forEach(one => {
+                const idx = one.indexOf(':');
+                if (idx <= 0) return;
+                const p = one.slice(0, idx).trim().toLowerCase();
+                const v = one.slice(idx + 1).trim();
+                if (p === 'font-family') family = v.replace(/^["']|["']$/g, '');
+                else if (p === 'font-weight') weight = v;
+                else if (p === 'font-style') style = v;
+                else if (p === 'font-stretch') stretch = v;
+                else if (p === 'src') {
+                    const ur = /url$\s*['"]?([^'")]+)['"]?\s*$/gi;
+                    let um;
+                    while ((um = ur.exec(v)) !== null) {
+                        const rp = resolvePath(cssPath, um[1]);
+                        if (rp) srcs.push(rp);
+                    }
+                }
+            });
+            if (family && srcs.length) faces.push({ family, srcs, weight, style, stretch });
+        }
+        return faces;
+    }
+
+    async function encryptedPaths(zip) {
+        const set = new Set();
+        try {
+            const s = await zip.textOf('META-INF/encryption.xml');
+            if (!s) return set;
+            const re = /URI\s*=\s*"([^"]+)"/gi;
+            let m;
+            while ((m = re.exec(s)) !== null) set.add(resolvePath('', m[1]));
+        } catch (e) { /* 没有就算了 */ }
+        return set;
+    }
+
+    async function buildFontCSS(zip, faces, encrypted) {
+        const families = new Set();
+        let css = '', total = 0;
+        const seen = Object.create(null);
+
+        for (let i = 0; i < faces.length; i++) {
+            if (total > FONT_BUDGET) break;
+            const f = faces[i];
+            let picked = '', ext = '';
+            for (let k = 0; k < f.srcs.length; k++) {
+                const p = f.srcs[k];
+                const e = (p.split('.').pop() || '').toLowerCase();
+                if (!FONT_MIME[e]) continue;
+                if (encrypted.has(p)) continue;          // 混淆字体解不出来，跳过
+                if (!zip.find(p)) continue;
+                picked = p; ext = e;
+                if (e === 'woff2' || e === 'woff') break;   // 优先小体积
+            }
+            if (!picked) continue;
+
+            const dedupKey = f.family.toLowerCase() + '|' + (f.weight || '') + '|' + (f.style || '') + '|' + picked;
+            if (seen[dedupKey]) continue;
+            seen[dedupKey] = 1;
+
+            try {
+                const bytes = await zip.bytes(picked);
+                if (!bytes || !bytes.length || bytes.length > 6 * 1024 * 1024) continue;
+                const url = await bytesToDataURL(bytes, FONT_MIME[ext]);
+                if (!url) continue;
+                total += url.length;
+                if (total > FONT_BUDGET) break;
+                css += '@font-face{font-family:"' + f.family.replace(/["\\]/g, '') + '";'
+                    + 'src:url(' + url + ') format("' + FONT_FMT[ext] + '");'
+                    + (f.weight ? 'font-weight:' + f.weight + ';' : '')
+                    + (f.style ? 'font-style:' + f.style + ';' : '')
+                    + (f.stretch ? 'font-stretch:' + f.stretch + ';' : '')
+                    + 'font-display:swap;}';
+                families.add(f.family.toLowerCase());
+            } catch (e) { /* 单个字体失败不影响其他 */ }
+        }
+        return { css, families };
     }
 
     /* ══════════ XHTML → 受控 HTML ══════════ */
@@ -519,14 +741,12 @@
 
     const VOID_TAGS = { br:1, hr:1, wbr:1, col:1, img:1 };
 
-    /* 只在块级边界记录切点，避免切在行内标签中间 */
     const CUT_TAGS = { p:1, div:1, section:1, article:1, blockquote:1, pre:1, ul:1, ol:1, li:1,
         dl:1, dd:1, dt:1, table:1, figure:1, figcaption:1, hr:1, center:1, header:1, footer:1,
         aside:1, h1:1, h2:1, h3:1, h4:1, h5:1, h6:1 };
 
     const HEAD_TAGS = { h1:1, h2:1, h3:1, h4:1, h5:1, h6:1 };
 
-    /* 开标签栈：把每个切点对应的「需补开标签 / 需补闭标签」预先算好并去重 */
     function makeStackTable() {
         const table = [{ pre: '', post: '' }];
         const keyOf = [''];
@@ -558,16 +778,16 @@
         let out = '';
         const cls = node.getAttribute ? node.getAttribute('class') : '';
         if (cls) out += ' class="' + escapeAttr(String(cls).slice(0, 240)) + '"';
-        const st = sanitizeDecls(node.getAttribute ? (node.getAttribute('style') || '') : '', true);
-        if (st) out += ' style="' + escapeAttr(st.slice(0, 400)) + '"';
+        const st = sanitizeInline(node.getAttribute ? (node.getAttribute('style') || '') : '');
+        if (st) out += ' style="' + escapeAttr(st.slice(0, 500)) + '"';
         if (tag === 'td' || tag === 'th') {
             const cs = node.getAttribute('colspan'), rs = node.getAttribute('rowspan');
             if (/^\d{1,3}$/.test(cs || '')) out += ' colspan="' + cs + '"';
             if (/^\d{1,3}$/.test(rs || '')) out += ' rowspan="' + rs + '"';
         }
         if (tag === 'ol') {
-            const st2 = node.getAttribute('start');
-            if (/^\d{1,6}$/.test(st2 || '')) out += ' start="' + st2 + '"';
+            const s = node.getAttribute('start');
+            if (/^\d{1,6}$/.test(s || '')) out += ' start="' + s + '"';
         }
         return out;
     }
@@ -590,7 +810,6 @@
         st.cur = 0; st.hist.length = 0;
 
         function push(s) { if (s) { parts.push(s); len += s.length; } }
-
         function markCut() { ctx.cuts.push({ p: baseOffset + len, s: st.cur }); }
 
         function emitImg(href, alt) {
@@ -619,8 +838,7 @@
             }
             if (nt !== 1) return;
 
-            let tag = (node.localName || node.tagName || '').toLowerCase();
-            tag = tag.split(':').pop();
+            let tag = (node.localName || node.tagName || '').toLowerCase().split(':').pop();
             if (DROP_TAGS[tag]) return;
 
             const id = node.getAttribute ? node.getAttribute('id') : null;
@@ -647,14 +865,11 @@
             }
 
             const mapped = TAG_MAP[tag] || (ALLOW_TAGS[tag] ? tag : (CUT_TAGS[tag] ? 'div' : 'span'));
-            const isCut = !!CUT_TAGS[mapped] || !!CUT_TAGS[tag];
-            if (isCut) markCut();
+            if (CUT_TAGS[mapped] || CUT_TAGS[tag]) markCut();
 
-            let extra = '';
-            if (tag === 'a') extra = ' data-a="1"';
+            if (VOID_TAGS[mapped]) { push('<' + mapped + attrsOf(node, mapped) + '>'); return; }
 
-            if (VOID_TAGS[mapped]) { push('<' + mapped + '>'); return; }
-
+            const extra = (tag === 'a') ? ' data-a="1"' : '';
             const open = '<' + mapped + attrsOf(node, mapped) + extra + '>';
             const close = '</' + mapped + '>';
             push(open);
@@ -683,7 +898,7 @@
         return { html: parts.join(''), anchors, heading, textLen, imgs };
     }
 
-    /* ══════════ 章节切分（切点带开闭标签，切片始终自洽） ══════════ */
+    /* ══════════ 章节切分 ══════════ */
 
     function fileTitle(path) {
         return String(path).split('/').pop().replace(/\.x?html?$/i, '');
@@ -761,8 +976,7 @@
         }
         if (!raw.length) raw.push({ title: '正文', from: 0, to: htmlLen, fromS: 0, toS: 0 });
 
-        const split = splitLong(ctx, raw);
-        return split.map(c => ({
+        return splitLong(ctx, raw).map(c => ({
             title: c.title,
             from: c.from,
             to: c.to,
@@ -867,7 +1081,7 @@
         } catch (e) { return ''; }
     }
 
-    /* 内文图片：超宽或体积过大才重编码；PNG/GIF 保留 PNG，避免透明底变黑 */
+    /* 返回原始宽高，交给 app.js 按容器宽度折算显示尺寸 */
     async function packImage(bytes, path) {
         const mime = guessMime(path);
         const raw = await bytesToDataURL(bytes, mime);
@@ -877,9 +1091,8 @@
         const info = await loadImage(raw);
         if (!info) return { u: raw, w: 0, h: 0 };
 
-        let w = info.w, h = info.h;
-        const needShrink = w > IMG_MAX_W || raw.length > 500000;
-        if (!needShrink) return { u: raw, w, h };
+        const w = info.w, h = info.h;
+        if (w <= IMG_MAX_W && raw.length <= 500000) return { u: raw, w, h };
 
         const scale = Math.min(1, IMG_MAX_W / (w || IMG_MAX_W));
         const nw = Math.max(1, Math.round(w * scale));
@@ -888,11 +1101,11 @@
         const out = keepAlpha
             ? drawScaled(info.img, nw, nh, 'image/png', undefined, false)
             : drawScaled(info.img, nw, nh, 'image/jpeg', 0.84, false);
-        if (out && out.length < raw.length) return { u: out, w: nw, h: nh };
+        // 缩放后仍按原始宽高上报，版面比例才不会走形
+        if (out && out.length < raw.length) return { u: out, w, h };
         return { u: raw, w, h };
     }
 
-    /* 封面：压到 420px 宽，白底 JPEG，书架只需要缩略图 */
     async function packCover(bytes, path) {
         const mime = guessMime(path);
         const raw = await bytesToDataURL(bytes, mime);
@@ -907,7 +1120,7 @@
         return (out && out.length < raw.length) ? out : raw;
     }
 
-    /* ══════════ 封面探测：多级兜底 ══════════ */
+    /* ══════════ 封面探测 ══════════ */
 
     async function firstImageInDoc(zip, path) {
         try {
@@ -934,13 +1147,11 @@
         const isImg = it => it && (it.type.indexOf('image') === 0 || /\.(jpe?g|png|gif|webp|bmp)$/i.test(it.path));
         const keys = Object.keys(manifest);
 
-        // 1) manifest properties="cover-image"
         for (let i = 0; i < keys.length; i++) {
             const m = manifest[keys[i]];
             if (/cover-image/.test(m.props) && zip.find(m.path)) return m.path;
         }
 
-        // 2) <meta name="cover" content="id">：可能指向图片，也可能指向封面页
         const metas = localTags(metaEl, 'meta');
         for (let i = 0; i < metas.length; i++) {
             if ((metas[i].getAttribute('name') || '').toLowerCase() !== 'cover') continue;
@@ -952,11 +1163,9 @@
             break;
         }
 
-        // 3) guide 里的封面页
         const refs = localTags(firstLocal(opf, 'guide'), 'reference');
         for (let i = 0; i < refs.length; i++) {
-            const ty = (refs[i].getAttribute('type') || '').toLowerCase();
-            if (ty.indexOf('cover') < 0) continue;
+            if ((refs[i].getAttribute('type') || '').toLowerCase().indexOf('cover') < 0) continue;
             const p0 = resolvePath(opfPath, refs[i].getAttribute('href') || '');
             if (!p0) continue;
             if (/\.(jpe?g|png|gif|webp)$/i.test(p0) && zip.find(p0)) return p0;
@@ -964,19 +1173,16 @@
             if (p) return p;
         }
 
-        // 4) 正文前几篇里「几乎没有文字、只有一张图」的文档 → 多看等排版的封面页
         for (let i = 0; i < Math.min(docs.length, 3); i++) {
             const d = docs[i];
             if (d.imgs && d.imgs.length && d.textLen < 60) return d.imgs[0];
         }
 
-        // 5) 路径里带 cover 的图片
         for (let i = 0; i < keys.length; i++) {
             const m = manifest[keys[i]];
             if (isImg(m) && /cover/i.test(m.path) && zip.find(m.path)) return m.path;
         }
 
-        // 6) 兜底：第一篇文档的第一张图
         for (let i = 0; i < Math.min(docs.length, 3); i++) {
             if (docs[i].imgs && docs[i].imgs.length) return docs[i].imgs[0];
         }
@@ -1002,7 +1208,6 @@
 
         report(0.08, '解析结构');
 
-        // 1) OPF
         let opfPath = '';
         const containerXML = await zip.textOf('META-INF/container.xml');
         if (containerXML) {
@@ -1025,7 +1230,6 @@
         const title = textOfEl(firstLocal(metaEl, 'title'));
         const author = textOfEl(firstLocal(metaEl, 'creator'));
 
-        // 2) manifest
         const manifest = Object.create(null);
         localTags(firstLocal(opf, 'manifest'), 'item').forEach(it => {
             const id = it.getAttribute('id');
@@ -1038,7 +1242,6 @@
             };
         });
 
-        // 3) spine
         const spineEl = firstLocal(opf, 'spine');
         const spine = [];
         localTags(spineEl, 'itemref').forEach(ir => {
@@ -1055,7 +1258,6 @@
         }
         if (!spine.length) throw new Error('EPUB 里找不到正文文档');
 
-        // 4) 目录
         let toc = [];
         let navItem = null;
         Object.keys(manifest).forEach(k => { if (/nav/.test(manifest[k].props)) navItem = manifest[k]; });
@@ -1082,7 +1284,35 @@
             (fragsByPath[e.path] || (fragsByPath[e.path] = Object.create(null)))[e.frag] = 1;
         });
 
-        // 5) 逐篇转 HTML
+        /* ── 样式第一遍：读全部 CSS，收 @font-face，把字体内联进来 ── */
+        report(0.10, '提取字体');
+        const cssKeys = Object.keys(manifest).filter(k =>
+            manifest[k].type.indexOf('text/css') >= 0 || /\.css$/i.test(manifest[k].path));
+        const cssTexts = [];
+        let faces = [];
+        for (let i = 0; i < cssKeys.length; i++) {
+            try {
+                const p = manifest[cssKeys[i]].path;
+                const s = await zip.textOf(p);
+                if (!s) continue;
+                cssTexts.push({ path: p, text: s });
+                faces = faces.concat(collectFontFaces(s, p));
+            } catch (e) { /* 单表失败跳过 */ }
+        }
+        const encrypted = await encryptedPaths(zip);
+        const fontPack = await buildFontCSS(zip, faces, encrypted);
+        currentFonts = fontPack.families;
+
+        /* ── 样式第二遍：作用域化 + 净化 ── */
+        report(0.16, '提取样式');
+        let css = fontPack.css;
+        for (let i = 0; i < cssTexts.length && css.length < CSS_BUDGET; i++) {
+            css += scopeCSS(cssTexts[i].text);
+            if (i % 4 === 0) await nextTick();
+        }
+        if (css.length > CSS_BUDGET) css = css.slice(0, CSS_BUDGET);
+
+        /* ── 正文 ── */
         const ctx = {
             cuts: [],
             stack: makeStackTable(),
@@ -1106,7 +1336,7 @@
 
         for (let i = 0; i < spine.length; i++) {
             const item = spine[i];
-            report(0.10 + 0.55 * (i / spine.length), '转换正文 ' + (i + 1) + '/' + spine.length);
+            report(0.20 + 0.45 * (i / spine.length), '转换正文 ' + (i + 1) + '/' + spine.length);
             if (i % 6 === 0) await nextTick();
 
             let str = null;
@@ -1119,13 +1349,8 @@
 
             const r = serializeDoc(ctx, root, item.path, fragsByPath[item.path] || Object.create(null), offset);
             docs.push({
-                path: item.path,
-                offset,
-                length: r.html.length,
-                anchors: r.anchors,
-                heading: r.heading,
-                textLen: r.textLen,
-                imgs: r.imgs
+                path: item.path, offset, length: r.html.length,
+                anchors: r.anchors, heading: r.heading, textLen: r.textLen, imgs: r.imgs
             });
             pieces.push(r.html);
             offset += r.html.length;
@@ -1135,29 +1360,16 @@
         const html = pieces.join('');
         if (!textLength && !ctx.imgPaths.length) throw new Error('EPUB 正文为空，可能带 DRM 加密');
 
-        // 6) 样式
-        report(0.68, '提取样式');
-        let css = '';
-        const cssKeys = Object.keys(manifest).filter(k => manifest[k].type.indexOf('text/css') >= 0
-            || /\.css$/i.test(manifest[k].path));
-        for (let i = 0; i < cssKeys.length && css.length < CSS_BUDGET; i++) {
-            try {
-                const s = await zip.textOf(manifest[cssKeys[i]].path);
-                if (s) css += scopeCSS(s);
-            } catch (e) { /* 单个样式表失败不影响整本 */ }
-        }
-        if (css.length > CSS_BUDGET) css = css.slice(0, CSS_BUDGET);
-
-        // 7) 图片：抽成 data URL，按 key 存映射，渲染时再回填 src
-        report(0.72, '提取插图');
+        /* ── 插图 ── */
+        report(0.68, '提取插图');
         const images = Object.create(null);
         let imgTotal = 0;
         const imgCount = ctx.imgPaths.length;
         for (let i = 0; i < imgCount; i++) {
             const p = ctx.imgPaths[i];
-            report(0.72 + 0.2 * (i / imgCount), '提取插图 ' + (i + 1) + '/' + imgCount);
+            report(0.68 + 0.24 * (i / imgCount), '提取插图 ' + (i + 1) + '/' + imgCount);
             if (i % 4 === 0) await nextTick();
-            if (imgTotal > IMG_BUDGET) break;                 // 超预算就停，正文照样能读
+            if (imgTotal > IMG_BUDGET) break;
             try {
                 const bytes = await zip.bytes(p);
                 if (!bytes || !bytes.length || bytes.length > 12 * 1024 * 1024) continue;
@@ -1165,10 +1377,10 @@
                 if (!packed || !packed.u) continue;
                 images[ctx.imgKeys[p]] = packed;
                 imgTotal += packed.u.length;
-            } catch (e) { /* 单张图失败跳过 */ }
+            } catch (e) { /* 单张失败跳过 */ }
         }
 
-        // 8) 封面
+        /* ── 封面 ── */
         report(0.94, '提取封面');
         let cover = '';
         try {
@@ -1180,10 +1392,10 @@
                 }
             }
         } catch (e) { cover = ''; }
-
         report(0.97, '构建目录');
         const chapters = buildChapters(ctx, html.length, docs, toc);
 
+        currentFonts = null;
         report(1, '完成');
         return {
             html,
@@ -1199,5 +1411,4 @@
     }
 
     global.EpubKit = { isEpub, parse };
-
 })(window);

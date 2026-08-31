@@ -51,9 +51,10 @@ const HEADER_OFFSET = 80;
 const MAX_BLOCK = 20000;
 const DOUBLE_TAP_MS = 200;
 
-/* EPUB 正文基础排版。放在书内样式之前注入，同特异度下书内规则可覆盖它 */
+/* EPUB 正文基础排版。注入顺序在书内样式之前，同特异度下书内规则可覆盖 */
 const EPUB_BASE_CSS = `
-#reader-content .epub-body{white-space:normal;}
+#reader-content .epub-body{white-space:normal;display:flow-root;overflow-wrap:break-word;word-wrap:break-word;}
+#reader-content .epub-body::after{content:"";display:block;clear:both;}
 #reader-content .epub-body p{margin:0 0 0.5em;text-indent:2em;}
 #reader-content .epub-body h1,#reader-content .epub-body h2,#reader-content .epub-body h3,
 #reader-content .epub-body h4,#reader-content .epub-body h5,#reader-content .epub-body h6{
@@ -62,7 +63,7 @@ margin:1.1em 0 0.6em;line-height:1.45;text-indent:0;font-weight:700;}
 #reader-content .epub-body h2{font-size:1.2em;}
 #reader-content .epub-body h3{font-size:1.1em;}
 #reader-content .epub-body h4,#reader-content .epub-body h5,#reader-content .epub-body h6{font-size:1em;}
-#reader-content .epub-body img{display:block;max-width:100%;height:auto;margin:0.8em auto;}
+#reader-content .epub-body img{max-width:100%;height:auto;vertical-align:middle;}
 #reader-content .epub-body blockquote{margin:0.8em 1em;padding-left:0.8em;border-left:2px solid var(--border-color);}
 #reader-content .epub-body ul,#reader-content .epub-body ol{margin:0.6em 0 0.6em 1.6em;padding:0;}
 #reader-content .epub-body li{margin:0.2em 0;text-indent:0;}
@@ -934,17 +935,30 @@ function chapterHTML(i) {
         + `</div>`;
 }
 
-/* 把 data-eimg 占位换成真正的 data URL。宽高先写上，避免图片解码后跳版 */
+/* 把 data-eimg 占位换成真正的 data URL。
+   尺寸按「容器宽 / 600px 页宽」折算：EPUB 的像素尺寸是相对 600px 页面写的，
+   照原样铺到手机屏上装饰图会顶满整行。属性优先级最低，书内 CSS 仍可覆盖。 */
 function hydrateImages(scope) {
     if (!isHTMLBook || !bookImages || !scope) return;
     const imgs = scope.querySelectorAll ? scope.querySelectorAll('img[data-eimg]') : [];
+    if (!imgs.length) return;
+
+    const container = document.getElementById('reader-content');
+    const cw = container ? container.clientWidth : 0;
+    const scale = cw ? Math.min(1, cw / 600) : 0.6;
+
     for (let i = 0; i < imgs.length; i++) {
         const el = imgs[i];
         const key = el.getAttribute('data-eimg');
         el.removeAttribute('data-eimg');
         const rec = bookImages[key];
         if (!rec || !rec.u) { el.style.display = 'none'; continue; }
-        if (rec.w && rec.h) { el.setAttribute('width', rec.w); el.setAttribute('height', rec.h); }
+        if (rec.w && rec.h) {
+            const w = Math.max(1, Math.round(rec.w * scale));
+            const h = Math.max(1, Math.round(rec.h * scale));
+            el.setAttribute('width', w);
+            el.setAttribute('height', h);
+        }
         el.setAttribute('decoding', 'async');
         el.src = rec.u;
     }
