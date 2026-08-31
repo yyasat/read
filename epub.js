@@ -476,7 +476,7 @@
         let bgLum = -1;
         pairs.forEach(([prop, val]) => {
             if (prop !== 'background' && prop !== 'background-color') return;
-            const raw = val.replace(/url$[^)]*$/gi, '').trim();
+            const raw = val.replace(/url\([^)]*\)/gi, '').trim();
             if (!raw || /^(none|transparent)$/i.test(raw)) return;
             const c = parseColor(raw.split(/\s+/)[0]) || parseColor(raw);
             if (c && c[3] >= 0.6) bgLum = luminance(c);
@@ -655,7 +655,7 @@
                 else if (p === 'font-style') style = v;
                 else if (p === 'font-stretch') stretch = v;
                 else if (p === 'src') {
-                    const ur = /url$\s*['"]?([^'")]+)['"]?\s*$/gi;
+                    const ur = /url\(\s*['"]?([^'")]+)['"]?\s*\)/gi;
                     let um;
                     while ((um = ur.exec(v)) !== null) {
                         const rp = resolvePath(cssPath, um[1]);
