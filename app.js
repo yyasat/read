@@ -2,11 +2,13 @@ document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 
 /* ═══════════════════════════════════════════════════════════
    数据分层：
-   - books 存储：{ id, name, content, chapters, rawFile, encoding, format }  ← 重，只按 id 单条取
-   - meta  存储：书架/搜索/进度需要的全部轻量字段                            ← 启动只读这个
-   内存里的 books[] 数组从此只装 meta，不再驻留任何正文。
+   - books 存储：{ id, name, content, chapters, images, css, isHTML,
+                   textLength, rawFile, encoding, format }   ← 重，只按 id 单条取
+   - meta  存储：书架/搜索/进度需要的全部轻量字段              ← 启动只读这个
 
-   EPUB 支持依赖 epub.js（window.EpubKit），必须在本文件之前加载。
+   EPUB 的 content 是受控 HTML（epub.js 产出），章节 from/to 落在块边界，
+   并带 pre/post 补齐开闭标签，因此切片后仍是自洽 HTML。
+   图片不写进 content，而是 images 映射，渲染时回填 src。
    ═══════════════════════════════════════════════════════════ */
 
 let db;
@@ -27,11 +29,13 @@ let searchReturnTimeout = null;
 let recordTouchY = 0;
 let recordTouchTime = 0;
 let recordPageIndex = 0;
-let importing = false;   // 防止导入任务并发
+let importing = false;
 
 /* ═══════════ 阅读器状态 ═══════════ */
 let bookContent = "";
 let chapters = [];
+let isHTMLBook = false;
+let bookImages = null;
 let currentChapterIdx = 0;
 let loadedStart = 0;
 let loadedEnd = -1;
@@ -41,11 +45,39 @@ let seekTimer = null;
 let isAdjusting = false;
 let loadingAborted = false;
 
-const WINDOW_MAX = 7;      // DOM 中最多保留的章节块数
-const EDGE_PX = 1200;      // 距上/下边缘多少像素开始续载
-const HEADER_OFFSET = 80;  // 顶栏遮挡高度
-const MAX_BLOCK = 20000;   // 单个渲染块最大字数，超长章节按此切块
-const DOUBLE_TAP_MS = 200; // 双击判定窗口，直接决定单击打开的延迟
+const WINDOW_MAX = 7;
+const EDGE_PX = 1200;
+const HEADER_OFFSET = 80;
+const MAX_BLOCK = 20000;
+const DOUBLE_TAP_MS = 200;
+
+/* EPUB 正文基础排版。放在书内样式之前注入，同特异度下书内规则可覆盖它 */
+const EPUB_BASE_CSS = `
+#reader-content .epub-body{white-space:normal;}
+#reader-content .epub-body p{margin:0 0 0.5em;text-indent:2em;}
+#reader-content .epub-body h1,#reader-content .epub-body h2,#reader-content .epub-body h3,
+#reader-content .epub-body h4,#reader-content .epub-body h5,#reader-content .epub-body h6{
+margin:1.1em 0 0.6em;line-height:1.45;text-indent:0;font-weight:700;}
+#reader-content .epub-body h1{font-size:1.35em;}
+#reader-content .epub-body h2{font-size:1.2em;}
+#reader-content .epub-body h3{font-size:1.1em;}
+#reader-content .epub-body h4,#reader-content .epub-body h5,#reader-content .epub-body h6{font-size:1em;}
+#reader-content .epub-body img{display:block;max-width:100%;height:auto;margin:0.8em auto;}
+#reader-content .epub-body blockquote{margin:0.8em 1em;padding-left:0.8em;border-left:2px solid var(--border-color);}
+#reader-content .epub-body ul,#reader-content .epub-body ol{margin:0.6em 0 0.6em 1.6em;padding:0;}
+#reader-content .epub-body li{margin:0.2em 0;text-indent:0;}
+#reader-content .epub-body pre{white-space:pre-wrap;margin:0.8em 0;font-family:inherit;}
+#reader-content .epub-body table{border-collapse:collapse;margin:0.8em auto;max-width:100%;}
+#reader-content .epub-body td,#reader-content .epub-body th{border:1px solid var(--border-color);padding:4px 8px;}
+#reader-content .epub-body hr{border:none;border-top:1px solid var(--border-color);margin:1.2em 0;}
+#reader-content .epub-body sup,#reader-content .epub-body sub{font-size:0.7em;}
+#reader-content .epub-body center,#reader-content .epub-body figure,
+#reader-content .epub-body figcaption{text-indent:0;}
+#reader-content .epub-body figure{margin:0.8em 0;}
+#reader-content .epub-body figcaption{font-size:0.85em;opacity:0.7;text-align:center;}
+#reader-content .epub-body [data-a="1"]{color:var(--accent-color);}
+#reader-content .epub-body .epub-imgalt{display:block;text-align:center;font-size:0.8em;opacity:0.5;}
+`;
 
 const quotes = [
     "马上到达书籍世界...",
@@ -84,7 +116,7 @@ request.onupgradeneeded = (e) => {
     if (!_db.objectStoreNames.contains(STORE_NAME)) _db.createObjectStore(STORE_NAME, { keyPath: "id" });
     if (!_db.objectStoreNames.contains(META_STORE)) {
         _db.createObjectStore(META_STORE, { keyPath: "id" });
-        needMigrate = e.oldVersion > 0;   // 老库才需要迁移，全新安装不用
+        needMigrate = e.oldVersion > 0;
     }
 };
 request.onsuccess = async (e) => {
@@ -99,7 +131,6 @@ request.onsuccess = async (e) => {
 };
 request.onerror = () => { alert('数据库打开失败，请检查浏览器是否允许本地存储。'); };
 
-/* 老版本一次性迁移：用游标逐本读，避免一次把整库拉进内存 */
 function migrateToMeta() {
     return new Promise((resolve) => {
         const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
@@ -117,10 +148,11 @@ function migrateToMeta() {
     });
 }
 
-/* 从完整记录里抽出 meta */
+/* 从完整记录里抽出 meta。HTML 正文的字数取 textLength，不能拿 HTML 长度充数 */
 function buildMeta(book) {
     const content = book.content || '';
     const format = book.format || 'txt';
+    const isHTML = !!book.isHTML;
     return {
         id: book.id,
         name: book.name || '未命名',
@@ -137,9 +169,8 @@ function buildMeta(book) {
         encoding: book.encoding || '',
         hasRaw: !!book.rawFile,
         hasChapters: Array.isArray(book.chapters) && book.chapters.length > 0,
-        charCount: content.length,
-        // EPUB 是 UTF-8 内置编码，不参与乱码检测
-        garbled: format === 'epub' ? false : isGarbled(content)
+        charCount: isHTML ? (book.textLength || 0) : content.length,
+        garbled: (format === 'epub' || isHTML) ? false : isGarbled(content)
     };
 }
 
@@ -148,7 +179,6 @@ function saveMeta(meta) {
     txStore(META_STORE, 'readwrite').put(meta);
 }
 
-// 兼容旧调用名
 function updateBookInDB(meta) { saveMeta(meta); }
 
 function getBookRecord(id) {
@@ -429,7 +459,6 @@ function readFileAsBuffer(file) {
     });
 }
 
-/* onProgress 收 0~1 的字节读取比例，用于驱动导入进度条 */
 function readBlobAsText(blob, encoding, onProgress) {
     return new Promise((resolve) => {
         const reader = new FileReader();
@@ -448,7 +477,6 @@ function readBlobAsText(blob, encoding, onProgress) {
     });
 }
 
-// 探测 BOM，顺便判断是不是合法 UTF-8
 function inspectBytes(buffer) {
     const bytes = new Uint8Array(buffer);
     if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return { bom: 'utf-8' };
@@ -462,8 +490,6 @@ function inspectBytes(buffer) {
     }
 }
 
-/* 候选编码只在前 256KB 上试解码，大文件不用整本跑一遍
-   onProgress：0~0.28 为编码探测阶段，0.3~1 为整本解码阶段 */
 async function detectAndDecode(blob, onProgress) {
     const report = (p) => { if (onProgress) onProgress(Math.max(0, Math.min(1, p))); };
     const probe = blob.size > 262144 ? blob.slice(0, 262144) : blob;
@@ -510,9 +536,7 @@ async function detectAndDecode(blob, onProgress) {
     return { text: (full || '').replace(/^\uFEFF/, ''), encoding: best.encoding };
 }
 
-/* 重新解码/解析已入库的书
-   - EPUB：重新走一遍解析，刷新正文、目录、封面
-   - TXT ：用指定编码重新解码 */
+/* 重新解码/解析已入库的书 */
 async function reDecodeBook(id, encoding) {
     const meta = books.find(b => b.id === id);
     if (!meta) return;
@@ -527,12 +551,16 @@ async function reDecodeBook(id, encoding) {
         try {
             toast('正在重新解析 EPUB…');
             const r = await window.EpubKit.parse(record.rawFile);
-            record.content = r.text;
+            record.content = r.html;
             record.chapters = r.chapters;
+            record.images = r.images || {};
+            record.css = r.css || '';
+            record.isHTML = true;
+            record.textLength = r.textLength || 0;
             if (r.cover) record.cover = r.cover;
             txStore(STORE_NAME, 'readwrite').put(record);
 
-            meta.charCount = r.text.length;
+            meta.charCount = r.textLength || 0;
             meta.hasChapters = true;
             meta.garbled = false;
             if (r.cover) meta.cover = r.cover;
@@ -543,7 +571,7 @@ async function reDecodeBook(id, encoding) {
 
             renderBookshelf();
             syncEncodingUI(meta);
-            toast(`✓ 已重新解析，共 ${r.chapters.length} 章`);
+            toast(`✓ 已重新解析，共 ${r.chapters.length} 节`);
         } catch (e) {
             toast('EPUB 解析失败：' + (e && e.message ? e.message : '未知错误'));
         }
@@ -563,6 +591,10 @@ async function reDecodeBook(id, encoding) {
         }
         record.content = text.replace(/^\uFEFF/, '');
         record.chapters = null;
+        record.isHTML = false;
+        record.images = null;
+        record.css = '';
+        record.textLength = record.content.length;
         txStore(STORE_NAME, 'readwrite').put(record);
 
         meta.encoding = record.encoding;
@@ -596,7 +628,6 @@ function toast(msg) {
     el.hideTimer = setTimeout(() => { el.style.opacity = '0'; }, 2600);
 }
 
-/* 在「书籍详情」弹窗里动态插入编码选择区 */
 function ensureEncodingUI() {
     if (document.getElementById('encoding-section')) return;
     const categoryGroup = document.getElementById('edit-category');
@@ -631,7 +662,7 @@ function syncEncodingUI(meta) {
         sel.value = 'auto';
         sel.disabled = true;
         hint.textContent = meta.hasRaw
-            ? 'EPUB 使用文件内置编码，无需手动选择。若正文或目录有问题，点上方按钮可重新解析（阅读进度会重置）。'
+            ? 'EPUB 使用文件内置编码。若正文样式、插图或目录有问题，点上方按钮可重新解析（阅读进度会重置）。'
             : 'EPUB 来自备份导入，未保存原始文件，无法重新解析。';
         return;
     }
@@ -647,10 +678,7 @@ function syncEncodingUI(meta) {
     }
 }
 
-/* ═══════════════════════════════════════════
-   导入进度条
-   进度构成：已完成本数 + 当前文件内部读取比例，合成为总进度
-   ═══════════════════════════════════════════ */
+/* ═══════════ 导入进度条 ═══════════ */
 
 const nextFrame = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
 
@@ -704,7 +732,7 @@ async function importFiles(event) {
 
     const total = files.length;
     showImportProgress(total);
-    await nextFrame();   // 让弹窗先画出来，再进重活
+    await nextFrame();
 
     const report = [];
     for (let i = 0; i < total; i++) {
@@ -735,8 +763,12 @@ async function importFiles(event) {
                     id,
                     name: r.title || file.name.replace(/\.[^/.]+$/, ''),
                     author: r.author || '',
-                    content: r.text,
+                    content: r.html,
                     chapters: r.chapters,
+                    images: r.images || {},
+                    css: r.css || '',
+                    isHTML: true,
+                    textLength: r.textLength || 0,
                     cover: r.cover || '',
                     encoding: 'utf-8',
                     format: 'epub',
@@ -751,6 +783,10 @@ async function importFiles(event) {
                     name: file.name.replace(/\.[^/.]+$/, ''),
                     content: text,
                     chapters: null,
+                    images: null,
+                    css: '',
+                    isHTML: false,
+                    textLength: text.length,
                     encoding,
                     format: 'txt',
                     rawFile: file
@@ -818,13 +854,8 @@ function escapeHTML(str) {
 
 /* ═══════════════════════════════════════════
    阅读器：章节窗口化渲染
-   章节来源优先级：
-   1. 记录里带的 chapters（EPUB 目录，准确）
-   2. parseChapters 正则推断（TXT）
-   两者最终都会过 splitLongBlocks，保证单块不超过 MAX_BLOCK
    ═══════════════════════════════════════════ */
 
-/* 存量章节数据校验：坏数据一律回退到即时解析 */
 function validChapters(list, textLen) {
     if (!Array.isArray(list) || !list.length) return false;
     for (let i = 0; i < list.length; i++) {
@@ -836,11 +867,8 @@ function validChapters(list, textLen) {
     return true;
 }
 
-/* 超长块二次切分，切点尽量落在换行处。epub.js 在时复用同一实现 */
+/* 仅用于 TXT：按字数硬切，切点靠换行 */
 function splitLongBlocks(text, list) {
-    if (window.EpubKit && typeof window.EpubKit.splitLongBlocks === 'function') {
-        return window.EpubKit.splitLongBlocks(text, list);
-    }
     const out = [];
     for (let i = 0; i < list.length; i++) {
         const c = list[i], len = c.to - c.from;
@@ -893,12 +921,43 @@ function parseChapters(text) {
     return splitLongBlocks(text, raw);
 }
 
+/* HTML 书：切片外侧补上 pre/post，保证标签自洽；图片先占位，插入后再回填 */
 function chapterHTML(i) {
     const ch = chapters[i];
+    const slice = bookContent.slice(ch.from, ch.to);
+    const body = isHTMLBook
+        ? `<div class="chapter-body epub-body">${ch.pre || ''}${slice}${ch.post || ''}</div>`
+        : `<div class="chapter-body">${escapeHTML(slice)}</div>`;
     return `<div class="chapter-wrapper" data-index="${i}">`
         + `<div class="chapter-title-divider">${escapeHTML(ch.title)}</div>`
-        + `<div class="chapter-body">${escapeHTML(bookContent.slice(ch.from, ch.to))}</div>`
+        + body
         + `</div>`;
+}
+
+/* 把 data-eimg 占位换成真正的 data URL。宽高先写上，避免图片解码后跳版 */
+function hydrateImages(scope) {
+    if (!isHTMLBook || !bookImages || !scope) return;
+    const imgs = scope.querySelectorAll ? scope.querySelectorAll('img[data-eimg]') : [];
+    for (let i = 0; i < imgs.length; i++) {
+        const el = imgs[i];
+        const key = el.getAttribute('data-eimg');
+        el.removeAttribute('data-eimg');
+        const rec = bookImages[key];
+        if (!rec || !rec.u) { el.style.display = 'none'; continue; }
+        if (rec.w && rec.h) { el.setAttribute('width', rec.w); el.setAttribute('height', rec.h); }
+        el.setAttribute('decoding', 'async');
+        el.src = rec.u;
+    }
+}
+
+function injectBookStyles(css) {
+    let el = document.getElementById('yy-book-style');
+    if (!el) {
+        el = document.createElement('style');
+        el.id = 'yy-book-style';
+        document.head.appendChild(el);
+    }
+    el.textContent = isHTMLBook ? (EPUB_BASE_CSS + (css || '')) : '';
 }
 
 function renderWindow(centerIdx) {
@@ -908,15 +967,16 @@ function renderWindow(centerIdx) {
     let html = '';
     for (let i = loadedStart; i <= loadedEnd; i++) html += chapterHTML(i);
     container.innerHTML = html;
+    hydrateImages(container);
     currentChapterIdx = centerIdx;
 }
 
-// 首屏只渲染当前块，前一块延后补，首帧更快
 function renderFirstBlock(centerIdx) {
     const container = document.getElementById('reader-content');
     loadedStart = centerIdx;
     loadedEnd = centerIdx;
     container.innerHTML = chapterHTML(centerIdx);
+    hydrateImages(container);
     currentChapterIdx = centerIdx;
 }
 
@@ -929,6 +989,7 @@ function appendNext() {
     const container = document.getElementById('reader-content');
     loadedEnd++;
     container.insertAdjacentHTML('beforeend', chapterHTML(loadedEnd));
+    hydrateImages(container.lastElementChild);
     trimTop();
     return true;
 }
@@ -940,9 +1001,10 @@ function prependPrev() {
     const before = container.scrollHeight;
     loadedStart--;
     container.insertAdjacentHTML('afterbegin', chapterHTML(loadedStart));
+    hydrateImages(container.firstElementChild);   // 先落宽高，再量高度
     const after = container.scrollHeight;
     isAdjusting = true;
-    area.scrollTop += (after - before);   // 顶部插入后补偿，视觉上不跳
+    area.scrollTop += (after - before);
     isAdjusting = false;
     trimBottom();
     return true;
@@ -979,7 +1041,6 @@ function fillViewport() {
     }
 }
 
-/* 点开一本书：只按 id 取这一条记录，正文不进 books[] */
 async function openReader(id) {
     const loader = document.getElementById('loading-overlay');
     const quoteText = document.getElementById('loading-quote-text');
@@ -1011,10 +1072,21 @@ async function openReader(id) {
     else { sAuthor.style.display = 'none'; }
 
     bookContent = record.content || '';
-    // EPUB 带准确目录就直接用，TXT 或数据异常时回退正则推断
-    chapters = validChapters(record.chapters, bookContent.length)
-        ? splitLongBlocks(bookContent, record.chapters)
-        : parseChapters(bookContent);
+    isHTMLBook = !!record.isHTML;
+    bookImages = record.images || null;
+
+    if (isHTMLBook) {
+        // epub.js 已按块边界切好，这里不能再按字数硬切，否则会截断标签
+        chapters = validChapters(record.chapters, bookContent.length)
+            ? record.chapters
+            : [{ title: meta.name || '正文', from: 0, to: bookContent.length, pre: '', post: '' }];
+    } else {
+        chapters = validChapters(record.chapters, bookContent.length)
+            ? splitLongBlocks(bookContent, record.chapters)
+            : parseChapters(bookContent);
+    }
+
+    injectBookStyles(record.css);
 
     tocRendered = false;
     document.getElementById('toc-list').innerHTML =
@@ -1043,7 +1115,6 @@ async function openReader(id) {
             }
         }, 200);
 
-        // 首屏已可读，剩下的窗口在空闲时补齐
         setTimeout(() => {
             if (document.getElementById('reader-view').style.display !== 'block') return;
             prependPrev();
@@ -1126,7 +1197,7 @@ function saveProgressNow() {
     meta.lastReadChapterIdx = currentChapterIdx;
     meta.lastReadChapterTitle = chapters[currentChapterIdx].title;
     meta.lastReadChapterRatio = currentChapterRatio();
-    saveMeta(meta);   // 只写轻量 meta，不碰正文
+    saveMeta(meta);
 }
 
 function updateProgressBars() {
@@ -1189,7 +1260,6 @@ function nextChapter() { if (currentChapterIdx < chapters.length - 1) goToChapte
 
 function jumpToChapter(idx) { goToChapter(idx, 0); closePanels(); }
 
-/* 目录分批插入，上万条也不卡住主线程 */
 function renderTOC() {
     if (tocRendered) return;
     const list = document.getElementById('toc-list');
@@ -1227,8 +1297,12 @@ function closeReader() {
 
     document.getElementById('reader-content').innerHTML = '';
     document.getElementById('toc-list').innerHTML = '';
+    const styleEl = document.getElementById('yy-book-style');
+    if (styleEl) styleEl.textContent = '';
     bookContent = '';
     chapters = [];
+    isHTMLBook = false;
+    bookImages = null;
     loadedStart = 0;
     loadedEnd = -1;
     tocRendered = false;
@@ -1594,7 +1668,6 @@ function saveBookDetails() {
     b.notes = document.getElementById('edit-notes').value;
     saveMeta(b);
 
-    // books 存储里的 name 同步一份，导出备份时用得到
     getBookRecord(b.id).then(rec => {
         if (rec && rec.name !== newName) {
             rec.name = newName;
@@ -1659,7 +1732,7 @@ function handleDiscoverDrop(e) {
     importFiles({ target: { files: Array.from(e.dataTransfer.files), value: '' } });
 }
 
-// ── 发现页：搜索笔记（只查 meta，不触碰正文）──
+// ── 发现页：搜索笔记（只查 meta）──
 function searchNotes(query) {
     const resultsDiv = document.getElementById('note-search-results');
     if (!query.trim()) { resultsDiv.innerHTML = ''; return; }
@@ -1702,14 +1775,14 @@ function searchNotes(query) {
     }).join('');
 }
 
-/* ── 关于页：导出备份（游标逐本拼装，避免一次性全量入内存）── */
+/* ── 关于页：导出备份（游标逐本拼装）── */
 async function exportBackup() {
     const toastEl = document.getElementById('backup-toast');
     toastEl.style.display = 'block';
     toastEl.textContent = '正在打包备份…';
     try {
         const metaById = new Map(books.map(m => [m.id, m]));
-        const parts = ['\uFEFF{"version":"2.6","exportTime":"' + new Date().toISOString() + '","categories":'
+        const parts = ['\uFEFF{"version":"2.7","exportTime":"' + new Date().toISOString() + '","categories":'
             + JSON.stringify(categories) + ',"books":['];
 
         await new Promise((resolve, reject) => {
@@ -1726,6 +1799,10 @@ async function exportBackup() {
                     name: meta.name || rec.name,
                     content: rec.content || '',
                     chapters: rec.chapters || null,
+                    images: rec.images || null,
+                    css: rec.css || '',
+                    isHTML: !!rec.isHTML,
+                    textLength: rec.textLength || 0,
                     encoding: rec.encoding || meta.encoding || '',
                     format: rec.format || meta.format || 'txt'
                 });
@@ -1784,11 +1861,15 @@ async function importBackup(event) {
                 name: item.name || '未命名',
                 content: item.content || '',
                 chapters: Array.isArray(item.chapters) ? item.chapters : null,
+                images: item.images || null,
+                css: item.css || '',
+                isHTML: !!item.isHTML,
+                textLength: item.textLength || 0,
                 encoding: item.encoding || '',
                 format: item.format || 'txt'
             });
             const meta = buildMeta(item);
-            meta.hasRaw = false;   // 备份不含原始字节
+            meta.hasRaw = false;
             metaStore.put(meta);
             books.push(meta);
             added++;
