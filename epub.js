@@ -21,6 +21,13 @@
     const FONT_BUDGET = 8 * 1024 * 1024;
     const CSS_BUDGET = 500000;
 
+    /* 兜底规则，注入在书内样式之前，书里写了尺寸时以书内为准。
+       - epub-inl：夹在文字里的图（脚注标记、行内装饰），压到字号量级
+       - 没拿到尺寸的图：限高，避免独占一屏 */
+    const GUARD_CSS =
+        SCOPE + ' img.epub-inl{max-height:1.5em;width:auto;vertical-align:-0.15em;margin:0 0.1em;}'
+        + SCOPE + ' img:not([width]){max-height:80vh;}';
+
     const nextTick = () => new Promise(r => setTimeout(r, 0));
 
     let currentFonts = null;               // 本次解析成功嵌入的字体家族（小写）
@@ -377,6 +384,63 @@
     function firstLocal(root, name) { const l = localTags(root, name); return l.length ? l[0] : null; }
     function textOfEl(el) { return el ? String(el.textContent || '').replace(/\s+/g, ' ').trim() : ''; }
 
+    /* ══════════ 长度单位 ══════════ */
+
+    const UNIT_PX = { px: 1, pt: 4 / 3, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6 };
+
+    function trimNum(n) {
+        let s = n.toFixed(3);
+        if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+        return s;
+    }
+
+    function splitLen(v) {
+        const m = String(v || '').trim().toLowerCase().match(/^(-?[\d.]+)\s*([a-z%]*)$/);
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        if (!isFinite(n) || n <= 0) return null;
+        return { n, u: m[2] };
+    }
+
+    /* 属性里的长度 → px 数值。百分比、vw 之类返回 0（拿不到确定像素） */
+    function lenToPx(v) {
+        const p = splitLen(v);
+        if (!p) return 0;
+        if (!p.u || p.u === 'px') return p.n;
+        if (UNIT_PX[p.u]) return p.n * UNIT_PX[p.u];
+        if (p.u === 'em' || p.u === 'rem') return p.n * BASE_FS;
+        if (p.u === 'ex' || p.u === 'ch') return p.n * BASE_FS * 0.5;
+        return 0;
+    }
+
+    /* 属性里的长度 → CSS 值。px 折成 em，跟随用户字号缩放 */
+    function lenToCSS(v) {
+        const p = splitLen(v);
+        if (!p) return '';
+        if (!p.u || p.u === 'px') return trimNum(p.n / BASE_FS) + 'em';
+        if (UNIT_PX[p.u]) return trimNum(p.n * UNIT_PX[p.u] / BASE_FS) + 'em';
+        if (p.u === 'em' || p.u === 'rem') return trimNum(p.n) + 'em';
+        if (p.u === '%') return trimNum(Math.min(100, p.n)) + '%';
+        return '';
+    }
+
+    function attrFrom(tagStr, name) {
+        let re;
+        try {
+            re = new RegExp('(?:^|[\\s])' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i');
+        } catch (e) { return ''; }
+        const m = String(tagStr).match(re);
+        if (!m) return '';
+        return m[1] || m[2] || m[3] || '';
+    }
+
+    function joinStyle(a, b) {
+        a = String(a || '').replace(/;+\s*$/, '');
+        b = String(b || '').replace(/;+\s*$/, '');
+        if (a && b) return a + ';' + b;
+        return a || b;
+    }
+
     /* ══════════ 颜色 ══════════ */
 
     const NAMED_COLORS = {
@@ -433,12 +497,6 @@
         return out;
     }
 
-    function trimNum(n) {
-        let s = n.toFixed(3);
-        if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
-        return s;
-    }
-
     function pxToEm(v) {
         return v.replace(/(-?[\d.]+)px/gi, (m, n) => trimNum(parseFloat(n) / BASE_FS) + 'em');
     }
@@ -476,7 +534,7 @@
         let bgLum = -1;
         pairs.forEach(([prop, val]) => {
             if (prop !== 'background' && prop !== 'background-color') return;
-            const raw = val.replace(/url\([^)]*\)/gi, '').trim();
+            const raw = val.replace(/url[(][^)]*[)]/gi, '').trim();
             if (!raw || /^(none|transparent)$/i.test(raw)) return;
             const c = parseColor(raw.split(/\s+/)[0]) || parseColor(raw);
             if (c && c[3] >= 0.6) bgLum = luminance(c);
@@ -655,7 +713,7 @@
                 else if (p === 'font-style') style = v;
                 else if (p === 'font-stretch') stretch = v;
                 else if (p === 'src') {
-                    const ur = /url\(\s*['"]?([^'")]+)['"]?\s*\)/gi;
+                    const ur = /url[(]\s*['"]?([^'")]+)['"]?\s*[)]/gi;
                     let um;
                     while ((um = ur.exec(v)) !== null) {
                         const rp = resolvePath(cssPath, um[1]);
@@ -792,13 +850,63 @@
         return out;
     }
 
-    function svgImageHref(node) {
+    /* SVG 包装器里第一个带 href 的 <image> */
+    function svgImageEl(node) {
         const imgs = localTags(node, 'image');
         for (let i = 0; i < imgs.length; i++) {
             const h = imgs[i].getAttribute('xlink:href') || imgs[i].getAttribute('href');
-            if (h) return h;
+            if (h) return imgs[i];
         }
-        return '';
+        return null;
+    }
+
+    /* SVG 上的 width/height 转成内联样式。
+       这类包装器常用来放小尺寸装饰图，属性丢了就只剩 max-width:100%，会铺满整行 */
+    function svgBoxStyle(svgEl, imgEl) {
+        let w = svgEl.getAttribute('width') || '';
+        let h = svgEl.getAttribute('height') || '';
+        if (!w && imgEl) w = imgEl.getAttribute('width') || '';
+        if (!h && imgEl) h = imgEl.getAttribute('height') || '';
+
+        const cw = lenToCSS(w), ch = lenToCSS(h);
+        if (cw && ch) return 'width:' + cw + ';height:' + ch;
+        if (cw) return 'width:' + cw + ';height:auto';
+        if (ch) return 'height:' + ch + ';width:auto';
+        return '';   // 只有 viewBox：交给 packImage 报固有尺寸
+    }
+
+    /* 图是不是夹在正文文字里（脚注标记、行内装饰）。
+       往上找几层内联包装（a / sup / span 之类），碰到块级就停 */
+    function inTextFlow(node) {
+        let cur = node;
+        for (let depth = 0; depth < 4; depth++) {
+            const p = cur.parentNode;
+            if (!p || p.nodeType !== 1) return false;
+
+            const kids = p.childNodes;
+            for (let i = 0; i < kids.length; i++) {
+                const k = kids[i];
+                if (k === cur) continue;
+                if (k.nodeType === 3) {
+                    if (String(k.nodeValue || '').trim().length > 0) return true;
+                } else if (k.nodeType === 1) {
+                    const t = (k.localName || k.tagName || '').toLowerCase().split(':').pop();
+                    if (t === 'img' || t === 'svg' || t === 'image' || t === 'br') continue;
+                    if (String(k.textContent || '').trim().length > 0) return true;
+                }
+            }
+
+            const pt = (p.localName || p.tagName || '').toLowerCase().split(':').pop();
+            if (CUT_TAGS[pt]) return false;
+            cur = p;
+        }
+        return false;
+    }
+
+    function imgClassOf(node) {
+        let cls = String(node.getAttribute ? (node.getAttribute('class') || '') : '').trim();
+        if (inTextFlow(node)) cls = cls ? cls + ' epub-inl' : 'epub-inl';
+        return cls;
     }
 
     function serializeDoc(ctx, root, docPath, fragIds, baseOffset) {
@@ -812,7 +920,7 @@
         function push(s) { if (s) { parts.push(s); len += s.length; } }
         function markCut() { ctx.cuts.push({ p: baseOffset + len, s: st.cur }); }
 
-        function emitImg(href, alt) {
+        function emitImg(href, alt, cls, style) {
             const path = resolvePath(docPath, href);
             const key = path ? ctx.imgKey(path) : '';
             if (!key) {
@@ -820,7 +928,10 @@
                 return;
             }
             if (imgs.indexOf(path) < 0) imgs.push(path);
-            push('<img data-eimg="' + key + '" alt="' + escapeAttr(alt || '') + '">');
+            push('<img data-eimg="' + key + '"'
+                + (cls ? ' class="' + escapeAttr(String(cls).slice(0, 240)) + '"' : '')
+                + (style ? ' style="' + escapeAttr(String(style).slice(0, 500)) + '"' : '')
+                + ' alt="' + escapeAttr(alt || '') + '">');
         }
 
         function walk(node) {
@@ -848,19 +959,31 @@
 
             if (tag === 'img') {
                 markCut();
-                emitImg(node.getAttribute('src') || '', node.getAttribute('alt') || '');
+                const st0 = sanitizeInline(node.getAttribute('style') || '');
+                let box = '';
+                const aw = lenToCSS(node.getAttribute('width') || '');
+                const ah = lenToCSS(node.getAttribute('height') || '');
+                if (aw && ah) box = 'width:' + aw + ';height:' + ah;
+                else if (aw) box = 'width:' + aw + ';height:auto';
+                emitImg(node.getAttribute('src') || '', node.getAttribute('alt') || '',
+                    imgClassOf(node), joinStyle(box, st0));
                 return;
             }
             if (tag === 'svg') {
                 markCut();
-                const href = svgImageHref(node);
+                const imgEl = svgImageEl(node);
+                const href = imgEl ? (imgEl.getAttribute('xlink:href') || imgEl.getAttribute('href') || '') : '';
                 const ti = firstLocal(node, 'title');
-                if (href) emitImg(href, ti ? textOfEl(ti) : '');
+                if (href) {
+                    emitImg(href, ti ? textOfEl(ti) : '', imgClassOf(node),
+                        joinStyle(svgBoxStyle(node, imgEl), sanitizeInline(node.getAttribute('style') || '')));
+                }
                 return;
             }
             if (tag === 'image') {
                 markCut();
-                emitImg(node.getAttribute('xlink:href') || node.getAttribute('href') || '', '');
+                emitImg(node.getAttribute('xlink:href') || node.getAttribute('href') || '', '',
+                    imgClassOf(node), sanitizeInline(node.getAttribute('style') || ''));
                 return;
             }
 
@@ -1056,6 +1179,35 @@
         });
     }
 
+    /* SVG 的固有尺寸：width/height 优先，其次 viewBox。
+       都拿不到时用 300×150（浏览器默认对象尺寸），至少不会撑满容器 */
+    function svgSize(bytes) {
+        let head = '';
+        try { head = decodeUTF8(bytes.subarray(0, Math.min(bytes.length, 4096))); } catch (e) { head = ''; }
+        const tag = (head.match(/<svg\b[^>]*>/i) || [''])[0];
+        if (!tag) return { w: 300, h: 150 };
+
+        let w = lenToPx(attrFrom(tag, 'width'));
+        let h = lenToPx(attrFrom(tag, 'height'));
+
+        let vw = 0, vh = 0;
+        const vb = String(attrFrom(tag, 'viewBox')).trim().split(/[\s,]+/);
+        if (vb.length === 4) {
+            vw = Math.abs(parseFloat(vb[2])) || 0;
+            vh = Math.abs(parseFloat(vb[3])) || 0;
+        }
+
+        if (!w && !h) {
+            if (vw && vh) { w = vw; h = vh; }
+            else { w = 300; h = 150; }
+        } else if (!w) {
+            w = (vw && vh) ? h * vw / vh : h;
+        } else if (!h) {
+            h = (vw && vh) ? w * vh / vw : w;
+        }
+        return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+    }
+
     function loadImage(dataURL) {
         return new Promise(res => {
             let done = false;
@@ -1086,7 +1238,10 @@
         const mime = guessMime(path);
         const raw = await bytesToDataURL(bytes, mime);
         if (!raw) return null;
-        if (mime === 'image/svg+xml') return { u: raw, w: 0, h: 0 };
+        if (mime === 'image/svg+xml') {
+            const s = svgSize(bytes);           // SVG 常只有 viewBox，必须自己算尺寸
+            return { u: raw, w: s.w, h: s.h };
+        }
 
         const info = await loadImage(raw);
         if (!info) return { u: raw, w: 0, h: 0 };
@@ -1303,9 +1458,10 @@
         const fontPack = await buildFontCSS(zip, faces, encrypted);
         currentFonts = fontPack.families;
 
-        /* ── 样式第二遍：作用域化 + 净化 ── */
+        /* ── 样式第二遍：作用域化 + 净化 ──
+           GUARD_CSS 排在书内样式之前，书里自己写了尺寸时以书内为准 */
         report(0.16, '提取样式');
-        let css = fontPack.css;
+        let css = fontPack.css + GUARD_CSS;
         for (let i = 0; i < cssTexts.length && css.length < CSS_BUDGET; i++) {
             css += scopeCSS(cssTexts[i].text);
             if (i % 4 === 0) await nextTick();
