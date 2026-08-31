@@ -48,11 +48,11 @@
                     ondragover="event.preventDefault(); this.style.borderColor='var(--accent-color)';"
                     ondragleave="this.style.borderColor='var(--border-color)';"
                     ondrop="event.preventDefault(); this.style.borderColor='var(--border-color)'; handleDiscoverDrop(event);">
-                    <input type="file" id="discover-file-input" accept=".txt,.md,.docx" multiple onchange="importFiles(event)"
+                    <input type="file" id="discover-file-input" accept=".txt,.md,.epub" multiple onchange="importFiles(event)"
                         style="position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer; z-index:2;">
                     <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4; margin-bottom:10px; display:block; margin-left:auto; margin-right:auto; pointer-events:none;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                     <div style="font-size: 0.9rem; font-weight: bold; margin-bottom: 4px; pointer-events:none;">点击或拖拽导入</div>
-                    <div style="font-size: 0.72rem; opacity: 0.45; line-height: 1.6; pointer-events:none;">支持 TXT · MD · DOCX<br>可同时选择多个文件</div>
+                    <div style="font-size: 0.72rem; opacity: 0.45; line-height: 1.6; pointer-events:none;">支持 TXT · MD · EPUB<br>可同时选择多个文件</div>
                 </div>
             </div>
 
@@ -72,7 +72,7 @@
         <div id="tab-about" style="display:none; padding: 50px 20px 80px; position: relative; z-index: 1;">
             <div style="text-align:center; margin-bottom: 40px;">
                 <div style="font-size: 2.2rem; font-weight: 900; margin-bottom: 10px;">藏书馆</div>
-                <div style="font-size: 0.75rem; letter-spacing: 3px; color: var(--accent-color); margin-bottom: 20px;">VERSION 2.2 PRECISION</div>
+                <div style="font-size: 0.75rem; letter-spacing: 3px; color: var(--accent-color); margin-bottom: 20px;">VERSION 2.3 · EPUB</div>
                 <p style="opacity: 0.6; font-size: 0.9rem; line-height: 1.8;">极简无痕阅读器<br>为纯粹的阅读体验而生</p>
             </div>
 
@@ -349,6 +349,8 @@
         <button class="menu-btn" onclick="annotate('mark-highlight')">H</button>
     </div>
 
+    <!-- epub.js 必须在 app.js 之前：它负责挂出 window.EpubKit -->
+    <script src="epub.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
