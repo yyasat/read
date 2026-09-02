@@ -1932,14 +1932,45 @@ async function startUrlParse() {
         loadingText.textContent = '正在获取网页内容...';
         loadingOverlay.style.display = 'flex';
         
-        // 使用代理或直接获取（需处理 CORS）
-        const response = await fetch(url, {
-            mode: 'cors',
-            credentials: 'omit'
-        }).catch((err) => {
-            // 如果直接访问失败，提示用户
-            throw new Error(`网络请求失败\n\n可能的原因：\n1. 该网站禁止外部访问（CORS限制）\n2. 网址不正确或网站无法访问\n3. 网络连接问题\n\n建议：\n- 确认网址是否正确\n- 尝试其他小说网站\n- 使用浏览器"桌面模式"访问`);
-        });
+        // CORS 代理列表（按优先级尝试）
+        const proxies = [
+            '',  // 直连
+            'https://api.allorigins.win/raw?url=',
+            'https://corsproxy.io/?'
+        ];
+        
+        let response = null;
+        let lastError = null;
+        
+        // 依次尝试不同的代理
+        for (let i = 0; i < proxies.length; i++) {
+            try {
+                const proxyUrl = proxies[i] + encodeURIComponent(url);
+                const actualUrl = proxies[i] ? proxyUrl : url;
+                
+                if (i > 0) {
+                    loadingText.textContent = `尝试代理 ${i}/${proxies.length - 1}...`;
+                }
+                
+                response = await fetch(actualUrl, {
+                    mode: 'cors',
+                    credentials: 'omit',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                });
+                
+                if (response.ok) {
+                    loadingText.textContent = '网页获取成功...';
+                    break;  // 成功则退出循环
+                }
+            } catch (err) {
+                lastError = err;
+                if (i === proxies.length - 1) {
+                    throw new Error(`所有代理均失败\n\n该网站可能：\n1. 禁止外部访问（CORS限制）\n2. 网址不正确\n3. 需要登录才能访问\n\n建议：\n- 确认网址是否正确\n- 尝试其他小说网站`);
+                }
+            }
+        }
         
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
