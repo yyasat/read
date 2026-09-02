@@ -1903,3 +1903,274 @@ async function importBackup(event) {
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
     if (localStorage.getItem('yy_theme_v22') === 'auto') applyTheme('auto');
 });
+
+/* ═══════════ URL 导入功能 ═══════════ */
+
+async function startUrlParse() {
+    const url = document.getElementById('url-input').value.trim();
+    
+    if (!url) {
+        alert('请输入网址');
+        return;
+    }
+    
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        alert('请输入有效的网址（以 http:// 或 https:// 开头）');
+        return;
+    }
+    
+    const loadingOverlay = document.getElementById('loading-overlay');
+    const loadingText = document.getElementById('loading-quote-text');
+    
+    try {
+        // 检查是否为本地地址
+        if (url.includes('localhost') || url.includes('127.0.0.1') || url.includes('file://')) {
+            alert('⚠️ 无法导入本地文件\n\n请输入真实的在线小说网站地址\n例如：https://www.某小说网站.com/book/...');
+            return;
+        }
+        
+        loadingText.textContent = '正在获取网页内容...';
+        loadingOverlay.style.display = 'flex';
+        
+        // 使用代理或直接获取（需处理 CORS）
+        const response = await fetch(url, {
+            mode: 'cors',
+            credentials: 'omit'
+        }).catch((err) => {
+            // 如果直接访问失败，提示用户
+            throw new Error(`网络请求失败\n\n可能的原因：\n1. 该网站禁止外部访问（CORS限制）\n2. 网址不正确或网站无法访问\n3. 网络连接问题\n\n建议：\n- 确认网址是否正确\n- 尝试其他小说网站\n- 使用浏览器"桌面模式"访问`);
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        const html = await response.text();
+        
+        loadingText.textContent = '正在分析章节结构...';
+        
+        // 解析章节
+        const result = await parseNovelFromUrl(html, url);
+        
+        if (!result || !result.chapters || result.chapters.length === 0) {
+            throw new Error('未能识别到章节内容，请检查网址是否为小说页面');
+        }
+        
+        loadingText.textContent = `已识别 ${result.chapters.length} 个章节，正在导入...`;
+        
+        // 创建书籍
+        const bookId = await createBookFromUrl(result);
+        
+        loadingOverlay.style.display = 'none';
+        document.getElementById('url-input').value = '';
+        
+        alert(`成功导入《${result.title}》，共 ${result.chapters.length} 章`);
+        
+        // 刷新书架
+        await loadBooks();
+        
+        // 自动打开书籍
+        openBook(bookId);
+        
+    } catch (error) {
+        loadingOverlay.style.display = 'none';
+        console.error('URL 解析失败:', error);
+        alert(`导入失败: ${error.message}`);
+    }
+}
+
+async function parseNovelFromUrl(html, baseUrl) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    
+    let chapters = [];
+    let title = '';
+    let author = '';
+    
+    // 提取标题
+    title = doc.querySelector('h1')?.textContent.trim() || 
+            doc.querySelector('.book-title')?.textContent.trim() ||
+            doc.querySelector('.title')?.textContent.trim() ||
+            doc.querySelector('[class*="title"]')?.textContent.trim() ||
+            doc.title.split(/[-_|]|[【】]/)[0].trim() || 
+            '未命名小说';
+    
+    // 提取作者
+    author = doc.querySelector('.author')?.textContent.trim() ||
+             doc.querySelector('.writer')?.textContent.trim() ||
+             doc.querySelector('[class*="author"]')?.textContent.trim() ||
+             doc.querySelector('[class*="writer"]')?.textContent.trim() ||
+             '佚名';
+    
+    // 清理作者信息
+    author = author.replace(/^(作者|Author|by|文\s*：)[:\s]*/i, '').trim();
+    
+    // 策略1: 查找章节列表容器
+    const chapterListSelectors = [
+        '#chapter-list', '.chapter-list', '#list', '.list-chapter',
+        '.volume-list', '.chapter-wrapper', '[id*="chapter"]', '[class*="chapter-list"]',
+        '.book-chapter-list', '.catalog', '#catalog', '.mulu'
+    ];
+    
+    let chapterContainer = null;
+    for (const selector of chapterListSelectors) {
+        chapterContainer = doc.querySelector(selector);
+        if (chapterContainer && chapterContainer.querySelectorAll('a[href]').length > 3) break;
+    }
+    
+    if (chapterContainer) {
+        // 查找所有章节链接
+        const links = chapterContainer.querySelectorAll('a[href]');
+        
+        for (let i = 0; i < links.length; i++) {
+            const link = links[i];
+            const chapterTitle = link.textContent.trim();
+            let chapterUrl = link.getAttribute('href');
+            
+            // 处理相对路径
+            try {
+                chapterUrl = new URL(chapterUrl, baseUrl).href;
+            } catch {
+                continue;
+            }
+            
+            if (chapterTitle && chapterUrl && chapterTitle.length > 1 && chapterTitle.length < 100) {
+                chapters.push({
+                    title: chapterTitle,
+                    url: chapterUrl,
+                    content: '' // 内容稍后按需获取
+                });
+            }
+        }
+    }
+    
+    // 策略2: 如果没找到章节列表，尝试直接解析当前页面内容
+    if (chapters.length === 0) {
+        const contentSelectors = [
+            '#content', '.content', '#chapter-content', '.chapter-content',
+            '.article-content', 'article', '.text-content', '[id*="content"]',
+            '.read-content', '#read_content', '.book-content'
+        ];
+        
+        let contentDiv = null;
+        for (const selector of contentSelectors) {
+            contentDiv = doc.querySelector(selector);
+            if (contentDiv && contentDiv.textContent.trim().length > 200) break;
+        }
+        
+        if (contentDiv) {
+            // 单章节模式
+            const chapterTitle = doc.querySelector('h1, h2, .chapter-title, [class*="chapter-title"]')?.textContent.trim() || '第一章';
+            const content = extractTextContent(contentDiv);
+            
+            if (content.length > 100) {
+                chapters.push({
+                    title: chapterTitle,
+                    url: baseUrl,
+                    content: content
+                });
+            }
+        }
+    }
+    
+    return {
+        title,
+        author,
+        chapters
+    };
+}
+
+function extractTextContent(element) {
+    // 移除脚本和样式
+    const clone = element.cloneNode(true);
+    clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+    
+    // 获取段落
+    const paragraphs = [];
+    const blocks = clone.querySelectorAll('p, div, br');
+    
+    if (blocks.length > 5) {
+        blocks.forEach(block => {
+            const text = block.textContent.trim();
+            if (text && text.length > 5 && !text.match(/^(上一章|下一章|目录|返回|章节|更新)/)) {
+                paragraphs.push(text);
+            }
+        });
+    }
+    
+    // 如果段落提取失败，回退到纯文本
+    if (paragraphs.length < 3) {
+        const rawText = clone.textContent || '';
+        return rawText.split(/\n+/).filter(line => {
+            const trimmed = line.trim();
+            return trimmed.length > 10 && !trimmed.match(/^(上一章|下一章|目录|返回|章节|更新)/);
+        }).join('\n\n');
+    }
+    
+    return paragraphs.join('\n\n');
+}
+
+async function createBookFromUrl(result) {
+    const bookId = Date.now().toString();
+    
+    // 构建章节数据 - 合并所有章节内容
+    let fullContent = '';
+    const chapterMarkers = [];
+    
+    for (let i = 0; i < result.chapters.length; i++) {
+        const ch = result.chapters[i];
+        const chapterStart = fullContent.length;
+        
+        // 添加章节标题
+        fullContent += `\n\n${ch.title}\n\n`;
+        
+        // 如果有内容就用，没有就标记待加载
+        if (ch.content) {
+            fullContent += ch.content;
+        } else {
+            fullContent += `[本章内容尚未加载]\n\n来源: ${ch.url}`;
+        }
+        
+        const chapterEnd = fullContent.length;
+        
+        chapterMarkers.push({
+            title: ch.title,
+            from: chapterStart,
+            to: chapterEnd,
+            url: ch.url // 保存 URL 用于后续按需加载
+        });
+    }
+    
+    const book = {
+        id: bookId,
+        name: result.title,
+        content: fullContent,
+        chapters: chapterMarkers,
+        images: null,
+        css: '',
+        isHTML: false,
+        textLength: fullContent.length,
+        encoding: 'UTF-8',
+        format: 'url'
+    };
+    
+    const meta = buildMeta(book);
+    meta.author = result.author;
+    meta.category = '其他';
+    meta.notes = `网址导入\n来源: ${result.chapters[0]?.url || 'Unknown'}\n导入时间: ${new Date().toLocaleString()}\n共 ${result.chapters.length} 章`;
+    meta.addedAt = Date.now();
+    meta.lastRead = null;
+    meta.progress = 0;
+    meta.currentChapter = 0;
+    meta.currentPosition = 0;
+    
+    // 保存到数据库
+    const tx = db.transaction([STORE_NAME, META_STORE], 'readwrite');
+    tx.objectStore(STORE_NAME).put(book);
+    tx.objectStore(META_STORE).put(meta);
+    await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+    
+    books.push(meta);
+    
+    return bookId;
+}
