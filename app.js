@@ -1932,51 +1932,91 @@ async function startUrlParse() {
         loadingText.textContent = '正在获取网页内容...';
         loadingOverlay.style.display = 'flex';
         
-        // CORS 代理列表（按优先级尝试）
+        // CORS 代理列表（按优先级尝试）- 多个备用方案
         const proxies = [
-            '',  // 直连
-            'https://api.allorigins.win/raw?url=',
-            'https://corsproxy.io/?'
+            { url: '', name: '直连' },
+            { url: 'https://api.allorigins.win/get?url=', name: 'AllOrigins', parseJson: true },
+            { url: 'https://corsproxy.io/?', name: 'CorsProxy' },
+            { url: 'https://cors-anywhere.herokuapp.com/', name: 'CorsAnywhere' },
+            { url: 'https://api.codetabs.com/v1/proxy?quest=', name: 'CodeTabs' }
         ];
         
-        let response = null;
+        let html = null;
         let lastError = null;
+        let successProxy = null;
         
         // 依次尝试不同的代理
         for (let i = 0; i < proxies.length; i++) {
+            const proxy = proxies[i];
             try {
-                const proxyUrl = proxies[i] + encodeURIComponent(url);
-                const actualUrl = proxies[i] ? proxyUrl : url;
+                const actualUrl = proxy.url ? proxy.url + encodeURIComponent(url) : url;
                 
-                if (i > 0) {
-                    loadingText.textContent = `尝试代理 ${i}/${proxies.length - 1}...`;
-                }
+                loadingText.textContent = `尝试 ${proxy.name}... (${i + 1}/${proxies.length})`;
                 
-                response = await fetch(actualUrl, {
-                    mode: 'cors',
-                    credentials: 'omit',
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    }
-                });
+                const response = await Promise.race([
+                    fetch(actualUrl, {
+                        mode: 'cors',
+                        credentials: 'omit',
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'
+                        }
+                    }),
+                    new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('timeout')), 15000)
+                    )
+                ]);
                 
                 if (response.ok) {
-                    loadingText.textContent = '网页获取成功...';
-                    break;  // 成功则退出循环
+                    if (proxy.parseJson) {
+                        const data = await response.json();
+                        html = data.contents || data.data;
+                    } else {
+                        html = await response.text();
+                    }
+                    
+                    if (html && html.length > 100) {
+                        successProxy = proxy.name;
+                        loadingText.textContent = `✓ ${proxy.name} 连接成功`;
+                        break;
+                    }
                 }
             } catch (err) {
                 lastError = err;
-                if (i === proxies.length - 1) {
-                    throw new Error(`所有代理均失败\n\n该网站可能：\n1. 禁止外部访问（CORS限制）\n2. 网址不正确\n3. 需要登录才能访问\n\n建议：\n- 确认网址是否正确\n- 尝试其他小说网站`);
-                }
+                console.log(`${proxy.name} 失败:`, err.message);
             }
         }
         
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        // 所有代理都失败
+        if (!html) {
+            loadingOverlay.style.display = 'none';
+            const retry = confirm(
+                '❌ 自动导入失败\n\n' +
+                '该网站可能：\n' +
+                '• 禁止外部访问（CORS 限制）\n' +
+                '• 需要登录才能查看\n' +
+                '• 有严格的反爬虫机制\n\n' +
+                '🔧 解决方案：\n' +
+                '1. 在浏览器中打开该小说页面\n' +
+                '2. 手动复制章节列表或正文\n' +
+                '3. 使用"本地导入"粘贴内容\n\n' +
+                '点击"确定"查看详细教程'
+            );
+            
+            if (retry) {
+                alert(
+                    '📖 手动导入教程\n\n' +
+                    '步骤：\n' +
+                    '1. 在浏览器中打开：\n' + url + '\n\n' +
+                    '2. 复制小说内容\n' +
+                    '   • 如果是目录页，复制整个章节列表\n' +
+                    '   • 如果是正文页，复制章节文本\n\n' +
+                    '3. 返回阅读器，使用"本地导入"功能\n' +
+                    '   粘贴复制的内容即可导入\n\n' +
+                    '💡 提示：建议使用电脑浏览器，复制更方便'
+                );
+            }
+            return;
         }
-        
-        const html = await response.text();
         
         loadingText.textContent = '正在分析章节结构...';
         
